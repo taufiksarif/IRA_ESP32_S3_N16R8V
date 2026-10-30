@@ -8,7 +8,7 @@ The Arduino sketch is [`ESP32-S3-N16R8V.ino`](ESP32-S3-N16R8V.ino). The included
 
 The pin assignments target the ESP32-S3 N16R8 board shown in the image. In Arduino IDE, select **ESP32-S3 Dev Module** or the exact board variant if installed. Configure **16 MB flash** and **8 MB OPI PSRAM** using the available board menu options.
 
-The sketch uses Arduino-ESP32 libraries and the legacy ESP-IDF TWAI API from `driver/twai.h`. Select a core version that provides this API; if your installed core has changed it, the TWAI calls may need an API update.
+The sketch uses Arduino-ESP32 libraries, the Adafruit NeoPixel library, and the legacy ESP-IDF TWAI API from `driver/twai.h`. Install **Adafruit NeoPixel** through Arduino Library Manager. Select an Arduino-ESP32 core version that provides the legacy TWAI API; if your installed core has changed it, the TWAI calls may need an API update.
 
 ## GPIO assignment
 
@@ -29,9 +29,9 @@ All seven control outputs are active-HIGH in the sketch. Use suitable driver sta
 | Buzzer relay | 14 | Active-HIGH |
 | UART2 RX / TX | 16 / 17 | Connect to transceiver RO / DI respectively |
 | CAN TX / RX | 18 / 21 | Connect to a CAN transceiver, not directly to CANH/CANL |
-| Optional status LED | 2 | Active-HIGH output; use a series resistor |
+| Onboard addressable RGB LED | 48 | Default for the pictured revision; change `PIN_RGB_LED` to 38 if required by your board revision |
 
-Check the GPIO labels on your exact board before wiring. The pictured board has an RGB LED module whose pin/protocol is not assumed by this sketch; GPIO2 is used only as an optional external status LED output.
+Check the RGB LED data pin against your exact board revision. The sketch assumes an addressable one-pixel LED on GPIO48, as on many N16R8 boards; some revisions use GPIO38. The `PIN_RGB_LED` constant is near the other pin assignments. The sketch sets a low brightness to limit LED current.
 
 ## Features
 
@@ -43,6 +43,8 @@ Check the GPIO labels on your exact board before wiring. The pictured board has 
 - CAN/TWAI frame monitoring and manually initiated frame transmission through the protocol analyzer.
 - UART2 modes: Modbus RTU slave (unit ID 1), passive Modbus monitor, and raw UART text.
 - Live status, diagnostics, and a bounded analyzer event log.
+
+The RGB status LED blinks blue while no access-point client is connected, glows green when a client is connected and the controller is idle, glows amber during an automatic sequence, and glows red if the CAN driver is unavailable or the bus is off. Fault and sequence indications take priority over the Wi-Fi connection indication.
 
 CAN receive traffic is logged and counted; CAN messages do not directly control relay outputs. Modbus commands can request sequences and update timer settings.
 

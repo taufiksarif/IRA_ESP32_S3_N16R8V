@@ -1,6 +1,6 @@
 /*
   ESP32-S3 N16R8V inverter simulator
-  Wi-Fi AP+STA, UTF-8 web UI, seven active-HIGH outputs, optional GPIO2 LED status,
+  Wi-Fi AP+STA, UTF-8 web UI, seven active-HIGH outputs, onboard addressable RGB status LED,
   TWAI/CAN and UART2 selectable between Modbus RTU slave, passive monitor and
   raw text. Pin assignments below target the pictured ESP32-S3 N16R8 board.
 
@@ -11,8 +11,9 @@
   - GPIO19/20 are avoided because they are used by native USB/JTAG by default.
   - GPIO0, GPIO3, GPIO45 and GPIO46 are ESP32-S3 strapping pins and are not
     assigned to control outputs.
-  - GPIO2 is configured as a status output for an optional external LED. Use a
-    series resistor; this board's RGB LED pin and protocol have not been assumed.
+  - The onboard addressable RGB LED is configured on GPIO48 for the pictured
+    board revision. Some ESP32-S3 board revisions use GPIO38 instead; change
+    PIN_RGB_LED below if your board schematic identifies a different pin.
   - Do not connect ESP32 GPIOs directly to CANH/CANL: use a 3.3-V-compatible
     CAN transceiver. CAN uses GPIO18 (TX), GPIO21 (RX); UART2 uses GPIO17 (TX),
     GPIO16 (RX), and GPIO13 for RS-485 DE and /RE.
@@ -33,6 +34,7 @@
 #include <WebServer.h>
 #include <DNSServer.h>
 #include <Preferences.h>
+#include <Adafruit_NeoPixel.h>
 #include "driver/twai.h"
 
 // ---------------- Wi-Fi ----------------
@@ -46,11 +48,9 @@ static const IPAddress AP_SUBNET(255, 255, 255, 0);
 static const char *PREF_NAMESPACE = "wifi-config";
 
 // ---------------- ESP32-S3 N16R8 GPIO assignment ----------------
-// GPIO2 is an optional external status LED output; the pictured RGB LED is not
-// assumed to be a simple GPIO LED. Use a series resistor for an external LED.
-static constexpr int PIN_STATUS_LED = 2;
-static constexpr uint8_t LED_ON_LEVEL = HIGH;
-static constexpr uint8_t LED_OFF_LEVEL = LOW;
+// Addressable onboard RGB LED data pin for the pictured board revision.
+// Some board revisions wire the pixel to GPIO38; verify against the schematic.
+static constexpr int PIN_RGB_LED = 48;
 
 // Seven active-HIGH control outputs, on header GPIOs available on the pictured board.
 static constexpr int PIN_BRAKE  = 4;
@@ -739,7 +739,7 @@ const char INDEX_HTML[] PROGMEM =
   "async function refresh(){if(document.visibilityState!=='visible'){clearTimeout(refreshTimer);refreshTimer=setTimeout(refresh,10000);return;}let pollDelay=5000;try{const diagnosticsOpen=document.getElementById('diagnosticsPanel').open;const r=await fetch('/api/status'+(diagnosticsOpen?'':'?compact=1'),{cache:'no-store'});const s=await r.json();setConnectionState(true);if(!serialRateInitialized){document.getElementById('serialRate').value=String(s.uartBaud);serialRateInitialized=true;}if(!uartModeInitialized){activeUartMode=s.uartMode||'modbus';document.getElementById('uartMode').value=activeUartMode;updateUartModeControls();uartModeInitialized=true;}statusErrorCount=0;if(diagnosticsOpen)updateDiagnostics(s);states=s.outputs||{};lastSequenceActive=!!s.sequenceRunning;applyManualLocks();if(lastStaConnected!==null&&lastStaConnected!==!!s.staConnected)showToast(s.staConnected?'Router Wi-Fi connected':'Router Wi-Fi disconnected',s.staConnected?'':'warn');lastStaConnected=!!s.staConnected;if(lastReadyRelayOn!==null&&lastReadyRelayOn!==!!s.readyRelayOn&&s.readyRelayOn)showToast('Ready signal is ON');lastReadyRelayOn=!!s.readyRelayOn;\n"
   "buttons.forEach(b=>{const on=!!states[b.dataset.name];b.classList.toggle('on',on);b.setAttribute('aria-pressed',String(on));});\n"
   " const canRateField=document.getElementById('canRate');if(canRateField&&document.activeElement!==canRateField)canRateField.value=String(s.canBitrate||500000);const serialRateField=document.getElementById('serialRate');if(serialRateField&&document.activeElement!==serialRateField)serialRateField.value=String(s.uartBaud||115200);const apSsidField=document.getElementById('apSsid');if(apSsidField&&document.activeElement!==apSsidField)apSsidField.value=s.apSsid||'Repair Center';\n"
-  " const wifiPill=document.getElementById('wifiPill');wifiPill.classList.toggle('good',!!s.staConnected);wifiPill.classList.toggle('bad',!s.staConnected);document.getElementById('dashWifi').textContent=s.staConnected?'Connected':'Not connected';document.getElementById('dashRam').textContent=(Number(s.freeHeap||0)/1024).toFixed(1)+' / '+(Number(s.minFreeHeap||0)/1024).toFixed(1)+' KB';const safetyPill=document.getElementById('safetyPill');document.getElementById('dashSafety').textContent=s.safetyState||'UNKNOWN';safetyPill.classList.toggle('good',s.safetyState==='READY');safetyPill.classList.toggle('warn',s.safetyState==='RUNNING');safetyPill.classList.toggle('bad',s.safetyState==='FAULT');document.getElementById('dashIp').textContent=s.apIp||'Unavailable';document.getElementById('dashClients').textContent=`${s.apClients} connected`;document.getElementById('clientPill').classList.toggle('good',Number(s.apClients)>0);document.getElementById('status').textContent=`AP: ${s.apSsid} (${s.apIp})\\nSTA: ${s.staConnected?'connected':'not connected'}${s.staConnected?' — '+s.staIp:''}\\nAP clients: ${s.apClients}\\nFree heap current/minimum: ${(Number(s.freeHeap||0)/1024).toFixed(1)} / ${(Number(s.minFreeHeap||0)/1024).toFixed(1)} KB\\nController state: ${s.safetyState||'UNKNOWN'}\\nCAN bus: ${['Unknown/stopped','Running','BUS-OFF','Recovering'][Number(s.canBusState)||0]}\\nAnalyzer dropped records: ${s.analyzerDropped??'Open diagnostics'}\\nGPIO2 status LED: ${s.apClients>0?'ON':'blinking'}\\nCAN RX frames: ${s.canRx??'—'}\\nModbus RX frames: ${s.modbusFrames??'—'}`;\n"
+  " const wifiPill=document.getElementById('wifiPill');wifiPill.classList.toggle('good',!!s.staConnected);wifiPill.classList.toggle('bad',!s.staConnected);document.getElementById('dashWifi').textContent=s.staConnected?'Connected':'Not connected';document.getElementById('dashRam').textContent=(Number(s.freeHeap||0)/1024).toFixed(1)+' / '+(Number(s.minFreeHeap||0)/1024).toFixed(1)+' KB';const safetyPill=document.getElementById('safetyPill');document.getElementById('dashSafety').textContent=s.safetyState||'UNKNOWN';safetyPill.classList.toggle('good',s.safetyState==='READY');safetyPill.classList.toggle('warn',s.safetyState==='RUNNING');safetyPill.classList.toggle('bad',s.safetyState==='FAULT');document.getElementById('dashIp').textContent=s.apIp||'Unavailable';document.getElementById('dashClients').textContent=`${s.apClients} connected`;document.getElementById('clientPill').classList.toggle('good',Number(s.apClients)>0);document.getElementById('status').textContent=`AP: ${s.apSsid} (${s.apIp})\\nSTA: ${s.staConnected?'connected':'not connected'}${s.staConnected?' — '+s.staIp:''}\\nAP clients: ${s.apClients}\\nFree heap current/minimum: ${(Number(s.freeHeap||0)/1024).toFixed(1)} / ${(Number(s.minFreeHeap||0)/1024).toFixed(1)} KB\\nController state: ${s.safetyState||'UNKNOWN'}\\nCAN bus: ${['Unknown/stopped','Running','BUS-OFF','Recovering'][Number(s.canBusState)||0]}\\nAnalyzer dropped records: ${s.analyzerDropped??'Open diagnostics'}\\nRGB status: ${!s.canDriverReady||s.canBusState===2?'FAULT':(s.sequenceRunning?'SEQUENCE':(s.apClients>0?'CONNECTED':'WAITING'))}\\nCAN RX frames: ${s.canRx??'—'}\\nModbus RX frames: ${s.modbusFrames??'—'}`;\n"
   " document.getElementById('seqStatus').textContent='Sequence: '+(s.sequenceStatus||'Idle')+(s.runModeActive?' — Run Mode active (up/down alternating; configured duration)':'');\n"
   " const rem=Math.max(0,Number(s.sequenceStepRemainingMs||0)),dur=Math.max(0,Number(s.sequenceStepDurationMs||0)),elapsed=Math.max(0,Number(s.sequenceStepElapsedMs||0));document.getElementById('seqStepName').textContent=s.sequenceRunning?(s.sequenceStatus||'Sequence running'):'Waiting for sequence';document.getElementById('seqStepTime').textContent=s.sequenceRunning?(Math.ceil(rem/1000)+' s remaining'):'—';document.getElementById('seqProgressBar').style.width=s.sequenceRunning&&dur?Math.min(100,elapsed/dur*100)+'%':'0%';document.getElementById('seqDirection').textContent='Direction: '+(String(s.sequenceStatus||'').toLowerCase().includes('down')?'DOWN':(String(s.sequenceStatus||'').toLowerCase().includes('up')?'UP':'—'));document.getElementById('seqStepDetail').textContent=s.sequenceRunning?('Elapsed '+Math.floor(elapsed/1000)+' s of '+Math.ceil(dur/1000)+' s'):'Progress appears while running';\n"
   " document.getElementById('autoUp').disabled=!!s.sequenceRunning;document.getElementById('autoDown').disabled=!!s.sequenceRunning;document.getElementById('runMode').disabled=!!s.sequenceRunning;\n"
@@ -1375,18 +1375,33 @@ void communicationTask(void *parameter) {
 }
 
 void statusLedTask(void *parameter) {
-  // Blink while no clients are connected to the ESP32 access point;
-  // remain steadily ON as soon as one or more AP clients are connected.
-  bool ledOn = false;
+  // Red = CAN fault, amber = sequence, green = connected/idle,
+  // blinking blue = no AP clients connected.
+  Adafruit_NeoPixel pixel(1, PIN_RGB_LED, NEO_GRB + NEO_KHZ800);
+  pixel.begin();
+  pixel.setBrightness(32);
+  pixel.clear();
+  pixel.show();
+  bool waitingLedOn = false;
   for (;;) {
     const uint8_t clients = WiFi.softAPgetStationNum();
-    if (clients > 0) {
-      digitalWrite(PIN_STATUS_LED, LED_ON_LEVEL);
-      ledOn = true;
+    if (!canDriverReady || canBusState == 2) {
+      pixel.setPixelColor(0, pixel.Color(255, 0, 0));
+      pixel.show();
+      vTaskDelay(pdMS_TO_TICKS(300));
+    } else if (sequenceRunning) {
+      pixel.setPixelColor(0, pixel.Color(255, 72, 0));
+      pixel.show();
       vTaskDelay(pdMS_TO_TICKS(200));
+    } else if (clients > 0) {
+      pixel.setPixelColor(0, pixel.Color(0, 180, 0));
+      pixel.show();
+      waitingLedOn = false;
+      vTaskDelay(pdMS_TO_TICKS(300));
     } else {
-      ledOn = !ledOn;
-      digitalWrite(PIN_STATUS_LED, ledOn ? LED_ON_LEVEL : LED_OFF_LEVEL);
+      waitingLedOn = !waitingLedOn;
+      pixel.setPixelColor(0, waitingLedOn ? pixel.Color(0, 0, 150) : pixel.Color(0, 0, 0));
+      pixel.show();
       vTaskDelay(pdMS_TO_TICKS(500));
     }
   }
@@ -1466,9 +1481,6 @@ void setup() {
   if (apSSID.isEmpty() || apSSID.length() > 32) apSSID = DEFAULT_AP_SSID;
   if (apPassword.length() < 8 || apPassword.length() > 63) apPassword = DEFAULT_AP_PASSWORD;
 
-  // GPIO2 is an optional external status LED output on this S3 build.
-  pinMode(PIN_STATUS_LED, OUTPUT);
-  digitalWrite(PIN_STATUS_LED, LED_OFF_LEVEL);
   WiFi.mode(WIFI_AP_STA);
   WiFi.setSleep(false);
   // Configure the AP address before starting the access point.
