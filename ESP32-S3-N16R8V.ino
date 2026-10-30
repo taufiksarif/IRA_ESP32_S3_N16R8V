@@ -1,27 +1,31 @@
 /*
-  ESP32 DevKit V1 / ESP-WROOM-32 inverter simulator
-  Wi-Fi AP+STA, UTF-8 web UI, seven active-HIGH outputs, onboard blue LED status,
-  TWAI/CAN (TX GPIO21, RX GPIO22) and UART2 selectable between Modbus RTU slave and
-  raw text (RX GPIO16, TX GPIO17, RS-485 driver enable GPIO4, slave ID 1).
-  The RGB matrix is disabled to free GPIO2 for LED status.
+  ESP32-S3 N16R8V inverter simulator
+  Wi-Fi AP+STA, UTF-8 web UI, seven active-HIGH outputs, optional GPIO2 LED status,
+  TWAI/CAN and UART2 selectable between Modbus RTU slave, passive monitor and
+  raw text. Pin assignments below target the pictured ESP32-S3 N16R8 board.
 
   IMPORTANT HARDWARE LIMITATIONS:
-  - The RGB matrix is disabled in this build to use GPIO2 for the onboard blue LED.
-  - GPIO0 and GPIO2 are ESP32 strapping pins. External circuitry connected to
-    these pins can affect boot; keep GPIO0 from being pulled LOW at reset.
-  - GPIO0 is intentionally unused by the control outputs to avoid boot-mode conflicts.
-  - Do not connect ESP32 GPIOs directly to a CANH/CANL bus: use a 3.3-V-compatible
-    CAN transceiver. The CAN controller pins are GPIO21 (TX) and GPIO22 (RX); UART2 uses GPIO17 (TX) and GPIO16 (RX).
-  - The AP uses WPA2 password protection by default (12345678); change it for bench use.
-    The web UI has no user login. This is not a safety controller.
-  - RGB matrix support is intentionally disabled in this build. GPIO2 is used for the onboard blue LED.
+  - GPIO22–GPIO25 do not exist on ESP32-S3.
+  - GPIO26–GPIO32 are reserved for flash/PSRAM on typical N16R8 modules;
+    GPIO33–GPIO37 are also used by octal flash/PSRAM on R8 modules.
+  - GPIO19/20 are avoided because they are used by native USB/JTAG by default.
+  - GPIO0, GPIO3, GPIO45 and GPIO46 are ESP32-S3 strapping pins and are not
+    assigned to control outputs.
+  - GPIO2 is configured as a status output for an optional external LED. Use a
+    series resistor; this board's RGB LED pin and protocol have not been assumed.
+  - Do not connect ESP32 GPIOs directly to CANH/CANL: use a 3.3-V-compatible
+    CAN transceiver. CAN uses GPIO18 (TX), GPIO21 (RX); UART2 uses GPIO17 (TX),
+    GPIO16 (RX), and GPIO13 for RS-485 DE and /RE.
+  - Wi-Fi uses the existing default AP password and has no web login. This is not
+    a safety controller. Wi-Fi security settings are intentionally unchanged.
 
-  Arduino IDE libraries:
-    * ESP32 board package (classic ESP32 target)
+  Arduino IDE board configuration:
+    * Select an ESP32-S3 Dev Module (or the exact vendor board if available).
+    * Configure 16 MB flash and 8 MB OPI PSRAM where those menu options exist.
 
-  Tested compile target should be a classic ESP32 Dev Module with Arduino-ESP32
-  core 2.x / ESP-IDF 4.x (legacy driver/twai.h API). Core 3.x compatibility may
-  require adapting the TWAI API to the installed ESP-IDF version.
+  Use an Arduino-ESP32 version that provides the legacy ESP-IDF TWAI API in
+  driver/twai.h. If the installed core changes that API, adapt the TWAI calls
+  to the version bundled with that core before deployment.
 */
 
 #include <Arduino.h>
@@ -41,32 +45,32 @@ static const IPAddress AP_GATEWAY(10, 10, 10, 10);
 static const IPAddress AP_SUBNET(255, 255, 255, 0);
 static const char *PREF_NAMESPACE = "wifi-config";
 
-// ---------------- GPIO assignment ----------------
-// RGB matrix pins/object are intentionally removed in this build.
-// GPIO2 is used for the onboard blue status LED (common DevKit V1 wiring).
-// If your board LED is active-LOW, swap LED_ON_LEVEL and LED_OFF_LEVEL.
+// ---------------- ESP32-S3 N16R8 GPIO assignment ----------------
+// GPIO2 is an optional external status LED output; the pictured RGB LED is not
+// assumed to be a simple GPIO LED. Use a series resistor for an external LED.
 static constexpr int PIN_STATUS_LED = 2;
 static constexpr uint8_t LED_ON_LEVEL = HIGH;
 static constexpr uint8_t LED_OFF_LEVEL = LOW;
 
-static constexpr int PIN_BRAKE  = 13;
-static constexpr int PIN_ENABLE = 14;
-static constexpr int PIN_UP     = 18;
-static constexpr int PIN_DOWN   = 19;
-static constexpr int PIN_SPEED0 = 25;
-static constexpr int PIN_SPEED1 = 26;
-static constexpr int PIN_SPEED2 = 27;
-// Additional relay features (classic ESP32 DevKit V1; verify board wiring).
-static constexpr int PIN_READY_BUTTON = 32; // button to GND, active LOW
-static constexpr int PIN_READY_RELAY = 23;  // active-HIGH relay module: LOW=OFF, HIGH=ON
-static constexpr int PIN_BUZZER_RELAY = 33; // active-HIGH relay driver
+// Seven active-HIGH control outputs, on header GPIOs available on the pictured board.
+static constexpr int PIN_BRAKE  = 4;
+static constexpr int PIN_ENABLE = 5;
+static constexpr int PIN_UP     = 6;
+static constexpr int PIN_DOWN   = 7;
+static constexpr int PIN_SPEED0 = 8;
+static constexpr int PIN_SPEED1 = 9;
+static constexpr int PIN_SPEED2 = 10;
+// Auxiliary I/O (verify final board header labeling and external driver wiring).
+static constexpr int PIN_READY_BUTTON = 11; // button to GND, active LOW
+static constexpr int PIN_READY_RELAY = 12;  // active-HIGH relay module: LOW=OFF, HIGH=ON
+static constexpr int PIN_BUZZER_RELAY = 14; // active-HIGH relay driver
 static constexpr uint32_t BUZZER_PULSE_MS = 250UL;
 
-static constexpr gpio_num_t PIN_CAN_TX = GPIO_NUM_21;
-static constexpr gpio_num_t PIN_CAN_RX = GPIO_NUM_22;
+static constexpr gpio_num_t PIN_CAN_TX = GPIO_NUM_18;
+static constexpr gpio_num_t PIN_CAN_RX = GPIO_NUM_21;
 static constexpr int PIN_UART_TX = 17;
 static constexpr int PIN_UART_RX = 16;
-static constexpr int PIN_MODBUS_DE = 4; // RS-485 DE and /RE tied together; LOW=receive, HIGH=transmit
+static constexpr int PIN_MODBUS_DE = 13; // RS-485 DE and /RE tied together; LOW=receive, HIGH=transmit
 static constexpr uint8_t MODBUS_SLAVE_ID = 1;
 static constexpr uint32_t DEFAULT_UART_BAUD = 115200;
 uint32_t uartBaud = DEFAULT_UART_BAUD;
@@ -680,7 +684,7 @@ const char INDEX_HTML[] PROGMEM =
   "<div class=\"actions\"><button type=\"submit\">Save &amp; reconnect router</button></div></form>\n"
   "<p class=\"warn\">Changing AP settings disconnects connected clients. Reconnect using the new network name and password. The default password is 12345678; change it for your bench.</p></div></details>\n"
   "<details class=\"card collapsible\"><summary>Status</summary><div class=\"collapse-body\"><div id=\"status\" class=\"status\">Loading…</div></div></details>\n"
-  "<details class=\"card collapsible\"><summary>Modbus RTU slave register map</summary><div class=\"collapse-body\"><p class=\"muted\">UART2 offers Modbus RTU slave, Passive Monitor, and Raw UART text modes. Only one is active at a time; choose in Protocol Analyzer. Passive Monitor never transmits. Use an RS-485 transceiver; connect its RO to GPIO16, DI to GPIO17, and tied DE+/RE to GPIO4. Configure your master to match the UART baud shown in Protocol Analyzer.</p><div class=\"table-wrap\"><table><thead><tr><th>Holding register</th><th>Meaning</th><th>Access / values</th></tr></thead><tbody><tr><td>0</td><td>Sequence command / last command</td><td>Read/write: 0 stop, 1 up, 2 down, 3 run</td></tr><tr><td>1</td><td>Sequence status</td><td>Read: 0 idle, 1 sequence, 2 run mode</td></tr><tr><td>2</td><td>Output bitfield</td><td>Read: bits 0–6 = Brake, Enable, Up, Down, Speed 0, Speed 1, Speed 2</td></tr><tr><td>3</td><td>Current step time remaining</td><td>Read, seconds</td></tr><tr><td>16–28 (0x0010–0x001C)</td><td>Sequence timer settings</td><td>Read/write: seconds, except Run Mode duration in hours</td></tr></tbody></table></div><p class=\"muted\">Supported functions: 03 read holding registers, 06 write single register, and 16 (0x10) write multiple timer registers. Timer writes are saved to NVS. Function 16 is for timers; use function 06 for commands.</p></div></details>\n"
+  "<details class=\"card collapsible\"><summary>Modbus RTU slave register map</summary><div class=\"collapse-body\"><p class=\"muted\">UART2 offers Modbus RTU slave, Passive Monitor, and Raw UART text modes. Only one is active at a time; choose in Protocol Analyzer. Passive Monitor never transmits. Use an RS-485 transceiver; connect its RO to GPIO16, DI to GPIO17, and tied DE+/RE to GPIO13. Configure your master to match the UART baud shown in Protocol Analyzer.</p><div class=\"table-wrap\"><table><thead><tr><th>Holding register</th><th>Meaning</th><th>Access / values</th></tr></thead><tbody><tr><td>0</td><td>Sequence command / last command</td><td>Read/write: 0 stop, 1 up, 2 down, 3 run</td></tr><tr><td>1</td><td>Sequence status</td><td>Read: 0 idle, 1 sequence, 2 run mode</td></tr><tr><td>2</td><td>Output bitfield</td><td>Read: bits 0–6 = Brake, Enable, Up, Down, Speed 0, Speed 1, Speed 2</td></tr><tr><td>3</td><td>Current step time remaining</td><td>Read, seconds</td></tr><tr><td>16–28 (0x0010–0x001C)</td><td>Sequence timer settings</td><td>Read/write: seconds, except Run Mode duration in hours</td></tr></tbody></table></div><p class=\"muted\">Supported functions: 03 read holding registers, 06 write single register, and 16 (0x10) write multiple timer registers. Timer writes are saved to NVS. Function 16 is for timers; use function 06 for commands.</p></div></details>\n"
   "<details class=\"card collapsible\" id=\"diagnosticsPanel\"><summary>Diagnostics &amp; controller health</summary><div class=\"collapse-body\"><p class=\"muted\">Read-only health snapshot, refreshed with the dashboard. These checks report software and interface status; they do not verify external relay contacts or inverter safety.</p><div class=\"diagnostics-grid\"><div class=\"diag-tile\"><span>Control task</span><strong id=\"diagControl\">Checking…</strong><small id=\"diagControlDetail\">Heartbeat</small></div><div class=\"diag-tile\"><span>Minimum free heap</span><strong id=\"diagHeap\">—</strong><small id=\"diagHeapDetail\">Since boot</small></div><div class=\"diag-tile\"><span>Wi-Fi access point</span><strong id=\"diagWifi\">—</strong><small id=\"diagWifiDetail\">Clients</small></div><div class=\"diag-tile\"><span>Router Wi-Fi (STA)</span><strong id=\"diagSta\">—</strong><small id=\"diagStaDetail\">IP status</small></div><div class=\"diag-tile\"><span>CAN / TWAI</span><strong id=\"diagCan\">—</strong><small id=\"diagCanDetail\">Driver and errors</small></div><div class=\"diag-tile\"><span>Analyzer buffer</span><strong id=\"diagBuffer\">—</strong><small id=\"diagBufferDetail\">Bounded ring buffer</small></div><div class=\"diag-tile\"><span>Control stack headroom</span><strong id=\"diagStack\">—</strong><small>FreeRTOS stack high-water mark</small></div><div class=\"diag-tile\"><span>Log losses</span><strong id=\"diagLoss\">—</strong><small id=\"diagLossDetail\">Overwrites / dropped UART bytes</small></div></div><p class=\"muted\" id=\"diagUpdated\">Waiting for first status update…</p></div></details>\n"
   "<section class=\"card\" id=\"analyzerView\" hidden>\n"
   "<div class=\"analyzer-head\"><div><h2>Protocol Analyzer</h2><p class=\"muted\">Buffered live receive monitor · timestamps are milliseconds since ESP32 boot</p></div><button type=\"button\" id=\"backDashboard\">← Back to Dashboard</button></div>\n"
@@ -735,7 +739,7 @@ const char INDEX_HTML[] PROGMEM =
   "async function refresh(){if(document.visibilityState!=='visible'){clearTimeout(refreshTimer);refreshTimer=setTimeout(refresh,10000);return;}let pollDelay=5000;try{const diagnosticsOpen=document.getElementById('diagnosticsPanel').open;const r=await fetch('/api/status'+(diagnosticsOpen?'':'?compact=1'),{cache:'no-store'});const s=await r.json();setConnectionState(true);if(!serialRateInitialized){document.getElementById('serialRate').value=String(s.uartBaud);serialRateInitialized=true;}if(!uartModeInitialized){activeUartMode=s.uartMode||'modbus';document.getElementById('uartMode').value=activeUartMode;updateUartModeControls();uartModeInitialized=true;}statusErrorCount=0;if(diagnosticsOpen)updateDiagnostics(s);states=s.outputs||{};lastSequenceActive=!!s.sequenceRunning;applyManualLocks();if(lastStaConnected!==null&&lastStaConnected!==!!s.staConnected)showToast(s.staConnected?'Router Wi-Fi connected':'Router Wi-Fi disconnected',s.staConnected?'':'warn');lastStaConnected=!!s.staConnected;if(lastReadyRelayOn!==null&&lastReadyRelayOn!==!!s.readyRelayOn&&s.readyRelayOn)showToast('Ready signal is ON');lastReadyRelayOn=!!s.readyRelayOn;\n"
   "buttons.forEach(b=>{const on=!!states[b.dataset.name];b.classList.toggle('on',on);b.setAttribute('aria-pressed',String(on));});\n"
   " const canRateField=document.getElementById('canRate');if(canRateField&&document.activeElement!==canRateField)canRateField.value=String(s.canBitrate||500000);const serialRateField=document.getElementById('serialRate');if(serialRateField&&document.activeElement!==serialRateField)serialRateField.value=String(s.uartBaud||115200);const apSsidField=document.getElementById('apSsid');if(apSsidField&&document.activeElement!==apSsidField)apSsidField.value=s.apSsid||'Repair Center';\n"
-  " const wifiPill=document.getElementById('wifiPill');wifiPill.classList.toggle('good',!!s.staConnected);wifiPill.classList.toggle('bad',!s.staConnected);document.getElementById('dashWifi').textContent=s.staConnected?'Connected':'Not connected';document.getElementById('dashRam').textContent=(Number(s.freeHeap||0)/1024).toFixed(1)+' / '+(Number(s.minFreeHeap||0)/1024).toFixed(1)+' KB';const safetyPill=document.getElementById('safetyPill');document.getElementById('dashSafety').textContent=s.safetyState||'UNKNOWN';safetyPill.classList.toggle('good',s.safetyState==='READY');safetyPill.classList.toggle('warn',s.safetyState==='RUNNING');safetyPill.classList.toggle('bad',s.safetyState==='FAULT');document.getElementById('dashIp').textContent=s.apIp||'Unavailable';document.getElementById('dashClients').textContent=`${s.apClients} connected`;document.getElementById('clientPill').classList.toggle('good',Number(s.apClients)>0);document.getElementById('status').textContent=`AP: ${s.apSsid} (${s.apIp})\\nSTA: ${s.staConnected?'connected':'not connected'}${s.staConnected?' — '+s.staIp:''}\\nAP clients: ${s.apClients}\\nFree heap current/minimum: ${(Number(s.freeHeap||0)/1024).toFixed(1)} / ${(Number(s.minFreeHeap||0)/1024).toFixed(1)} KB\\nController state: ${s.safetyState||'UNKNOWN'}\\nCAN bus: ${['Unknown/stopped','Running','BUS-OFF','Recovering'][Number(s.canBusState)||0]}\\nAnalyzer dropped records: ${s.analyzerDropped??'Open diagnostics'}\\nBlue LED: ${s.apClients>0?'ON':'blinking'}\\nCAN RX frames: ${s.canRx??'—'}\\nModbus RX frames: ${s.modbusFrames??'—'}`;\n"
+  " const wifiPill=document.getElementById('wifiPill');wifiPill.classList.toggle('good',!!s.staConnected);wifiPill.classList.toggle('bad',!s.staConnected);document.getElementById('dashWifi').textContent=s.staConnected?'Connected':'Not connected';document.getElementById('dashRam').textContent=(Number(s.freeHeap||0)/1024).toFixed(1)+' / '+(Number(s.minFreeHeap||0)/1024).toFixed(1)+' KB';const safetyPill=document.getElementById('safetyPill');document.getElementById('dashSafety').textContent=s.safetyState||'UNKNOWN';safetyPill.classList.toggle('good',s.safetyState==='READY');safetyPill.classList.toggle('warn',s.safetyState==='RUNNING');safetyPill.classList.toggle('bad',s.safetyState==='FAULT');document.getElementById('dashIp').textContent=s.apIp||'Unavailable';document.getElementById('dashClients').textContent=`${s.apClients} connected`;document.getElementById('clientPill').classList.toggle('good',Number(s.apClients)>0);document.getElementById('status').textContent=`AP: ${s.apSsid} (${s.apIp})\\nSTA: ${s.staConnected?'connected':'not connected'}${s.staConnected?' — '+s.staIp:''}\\nAP clients: ${s.apClients}\\nFree heap current/minimum: ${(Number(s.freeHeap||0)/1024).toFixed(1)} / ${(Number(s.minFreeHeap||0)/1024).toFixed(1)} KB\\nController state: ${s.safetyState||'UNKNOWN'}\\nCAN bus: ${['Unknown/stopped','Running','BUS-OFF','Recovering'][Number(s.canBusState)||0]}\\nAnalyzer dropped records: ${s.analyzerDropped??'Open diagnostics'}\\nGPIO2 status LED: ${s.apClients>0?'ON':'blinking'}\\nCAN RX frames: ${s.canRx??'—'}\\nModbus RX frames: ${s.modbusFrames??'—'}`;\n"
   " document.getElementById('seqStatus').textContent='Sequence: '+(s.sequenceStatus||'Idle')+(s.runModeActive?' — Run Mode active (up/down alternating; configured duration)':'');\n"
   " const rem=Math.max(0,Number(s.sequenceStepRemainingMs||0)),dur=Math.max(0,Number(s.sequenceStepDurationMs||0)),elapsed=Math.max(0,Number(s.sequenceStepElapsedMs||0));document.getElementById('seqStepName').textContent=s.sequenceRunning?(s.sequenceStatus||'Sequence running'):'Waiting for sequence';document.getElementById('seqStepTime').textContent=s.sequenceRunning?(Math.ceil(rem/1000)+' s remaining'):'—';document.getElementById('seqProgressBar').style.width=s.sequenceRunning&&dur?Math.min(100,elapsed/dur*100)+'%':'0%';document.getElementById('seqDirection').textContent='Direction: '+(String(s.sequenceStatus||'').toLowerCase().includes('down')?'DOWN':(String(s.sequenceStatus||'').toLowerCase().includes('up')?'UP':'—'));document.getElementById('seqStepDetail').textContent=s.sequenceRunning?('Elapsed '+Math.floor(elapsed/1000)+' s of '+Math.ceil(dur/1000)+' s'):'Progress appears while running';\n"
   " document.getElementById('autoUp').disabled=!!s.sequenceRunning;document.getElementById('autoDown').disabled=!!s.sequenceRunning;document.getElementById('runMode').disabled=!!s.sequenceRunning;\n"
@@ -1147,7 +1151,7 @@ void controlTask(void *parameter) {
   };
   auto beginCycle = [&](int direction) {
     directionIndex = direction;
-    applyOutputChanges(0x7D, 1UL << 0); // clear directions/speeds and engage brake atomically
+    applyOutputChanges((1UL << OUTPUT_COUNT) - 1UL, 1UL << 0); // Disable, clear direction/speeds, and engage brake atomically
     beginStage(BRAKE_WAIT, getSequenceTimerMs(T_BRAKE), directionIndex == 2 ? "Auto UP: Brake hold" : "Auto DOWN: Brake hold");
     setSequenceRunning(true);
   };
@@ -1462,7 +1466,7 @@ void setup() {
   if (apSSID.isEmpty() || apSSID.length() > 32) apSSID = DEFAULT_AP_SSID;
   if (apPassword.length() < 8 || apPassword.length() > 63) apPassword = DEFAULT_AP_PASSWORD;
 
-  // Matrix is disabled; GPIO2 is reserved for the onboard status LED.
+  // GPIO2 is an optional external status LED output on this S3 build.
   pinMode(PIN_STATUS_LED, OUTPUT);
   digitalWrite(PIN_STATUS_LED, LED_OFF_LEVEL);
   WiFi.mode(WIFI_AP_STA);
