@@ -29,9 +29,9 @@ All seven control outputs are active-HIGH in the sketch. Use suitable driver sta
 | Buzzer relay | 14 | Active-HIGH |
 | UART2 RX / TX | 16 / 17 | Connect to transceiver RO / DI respectively |
 | CAN TX / RX | 18 / 21 | Connect to a CAN transceiver, not directly to CANH/CANL |
-| Onboard addressable RGB LED | 48 | Default for the pictured revision; change `PIN_RGB_LED` to 38 if required by your board revision |
+| Onboard addressable RGB LED | 48 | Default for the pictured revision; change `IRA_RGB_LED_PIN` to 38 if required by your board revision |
 
-Check the RGB LED data pin against your exact board revision. The sketch assumes an addressable one-pixel LED on GPIO48, as on many N16R8 boards; some revisions use GPIO38. The `PIN_RGB_LED` constant is near the other pin assignments. The sketch sets a low brightness to limit LED current.
+Check the RGB LED data pin against your exact board revision. The sketch assumes an addressable one-pixel LED on GPIO48, as on many N16R8 boards; some revisions use GPIO38. The `IRA_RGB_LED_PIN` constant is near the other pin assignments. The sketch sets a low brightness to limit LED current.
 
 ## Features
 

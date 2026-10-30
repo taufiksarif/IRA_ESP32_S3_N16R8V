@@ -13,7 +13,7 @@
     assigned to control outputs.
   - The onboard addressable RGB LED is configured on GPIO48 for the pictured
     board revision. Some ESP32-S3 board revisions use GPIO38 instead; change
-    PIN_RGB_LED below if your board schematic identifies a different pin.
+    IRA_RGB_LED_PIN below if your board schematic identifies a different pin.
   - Do not connect ESP32 GPIOs directly to CANH/CANL: use a 3.3-V-compatible
     CAN transceiver. CAN uses GPIO18 (TX), GPIO21 (RX); UART2 uses GPIO17 (TX),
     GPIO16 (RX), and GPIO13 for RS-485 DE and /RE.
@@ -50,7 +50,7 @@ static const char *PREF_NAMESPACE = "wifi-config";
 // ---------------- ESP32-S3 N16R8 GPIO assignment ----------------
 // Addressable onboard RGB LED data pin for the pictured board revision.
 // Some board revisions wire the pixel to GPIO38; verify against the schematic.
-static constexpr int PIN_RGB_LED = 48;
+static constexpr int IRA_RGB_LED_PIN = 48;
 
 // Seven active-HIGH control outputs, on header GPIOs available on the pictured board.
 static constexpr int PIN_BRAKE  = 4;
@@ -1377,7 +1377,7 @@ void communicationTask(void *parameter) {
 void statusLedTask(void *parameter) {
   // Red = CAN fault, amber = sequence, green = connected/idle,
   // blinking blue = no AP clients connected.
-  Adafruit_NeoPixel pixel(1, PIN_RGB_LED, NEO_GRB + NEO_KHZ800);
+  Adafruit_NeoPixel pixel(1, IRA_RGB_LED_PIN, NEO_GRB + NEO_KHZ800);
   pixel.begin();
   pixel.setBrightness(32);
   pixel.clear();
