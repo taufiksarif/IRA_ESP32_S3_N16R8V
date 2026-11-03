@@ -53,13 +53,13 @@ static const char *PREF_NAMESPACE = "wifi-config";
 static constexpr int IRA_RGB_LED_PIN = 48;
 
 // Seven active-HIGH control outputs, on header GPIOs available on the pictured board.
-static constexpr int PIN_BRAKE  = 4;
-static constexpr int PIN_ENABLE = 5;
-static constexpr int PIN_UP     = 6;
-static constexpr int PIN_DOWN   = 7;
-static constexpr int PIN_SPEED0 = 8;
-static constexpr int PIN_SPEED1 = 9;
-static constexpr int PIN_SPEED2 = 10;
+static constexpr int PIN_BRAKE  = 10;  // Change from 4
+static constexpr int PIN_ENABLE = 9;  // Change from 5
+static constexpr int PIN_UP     = 8;  // Change from 6
+static constexpr int PIN_DOWN   = 7;  // Change from 7
+static constexpr int PIN_SPEED0 = 6;  // Change from 8
+static constexpr int PIN_SPEED1 = 5;  // Change from 9
+static constexpr int PIN_SPEED2 = 4; // Change from 10
 // Auxiliary I/O (verify final board header labeling and external driver wiring).
 static constexpr int PIN_READY_BUTTON = 11; // button to GND, active LOW
 static constexpr int PIN_READY_RELAY = 12;  // active-HIGH relay module: LOW=OFF, HIGH=ON
