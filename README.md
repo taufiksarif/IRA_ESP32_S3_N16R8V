@@ -1,6 +1,6 @@
 # I.R.A. ESP32-S3 N16R8V Relay Controller
 
-I.R.A. (Interactive Relay Automation) is an ESP32-S3 web-controlled relay sequencer with automatic UP/DOWN cycles, configurable timers, CAN/TWAI monitoring and transmission, and UART2 support for Modbus RTU, passive monitoring, or raw text.
+I.R.A. (Interactive Relay Automation) is an ESP32-S3 web-controlled relay sequencer with automatic UP/DOWN cycles, configurable timers, CAN/TWAI monitoring and transmission, UART2 support for Modbus RTU/passive monitoring/raw text, an onboard RGB status LED, and a 16x2 LCD status display.
 
 The Arduino sketch is [`ESP32-S3-N16R8V.ino`](ESP32-S3-N16R8V.ino). The included board image is [`ESP32-S3-N16R8V.jpg`](ESP32-S3-N16R8V.jpg).
 
@@ -8,7 +8,7 @@ The Arduino sketch is [`ESP32-S3-N16R8V.ino`](ESP32-S3-N16R8V.ino). The included
 
 The pin assignments target the ESP32-S3 N16R8 board shown in the image. In Arduino IDE, select **ESP32-S3 Dev Module** or the exact board variant if installed. Configure **16 MB flash** and **8 MB OPI PSRAM** using the available board menu options.
 
-The sketch uses Arduino-ESP32 libraries, the built-in **LiquidCrystal** library, the Adafruit NeoPixel library, and the legacy ESP-IDF TWAI API from `driver/twai.h`. Install **Adafruit NeoPixel** through Arduino Library Manager. Select an Arduino-ESP32 core version that provides the legacy TWAI API; if your installed core has changed it, the TWAI calls may need an API update.
+The sketch uses Arduino-ESP32 libraries, **LiquidCrystal**, **Adafruit NeoPixel**, and the legacy ESP-IDF TWAI API from `driver/twai.h`. Install the **LiquidCrystal** and **Adafruit NeoPixel** libraries through Arduino Library Manager if they are not already installed. Select an Arduino-ESP32 core version that provides the legacy TWAI API; if your installed core has changed it, the TWAI calls may need an API update.
 
 ## GPIO assignment
 
