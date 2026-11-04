@@ -16,13 +16,13 @@ All seven control outputs are active-HIGH in the sketch. Use suitable driver sta
 
 | Function | GPIO | Electrical behavior |
 |---|---:|---|
-| Brake | 4 | Active-HIGH |
-| Enable | 5 | Active-HIGH |
-| Up | 6 | Active-HIGH |
+| Brake | 10 | Active-HIGH |
+| Enable | 9 | Active-HIGH |
+| Up | 8 | Active-HIGH |
 | Down | 7 | Active-HIGH |
-| Speed 0 | 8 | Active-HIGH |
-| Speed 1 | 9 | Active-HIGH |
-| Speed 2 | 10 | Active-HIGH |
+| Speed 0 | 6 | Active-HIGH |
+| Speed 1 | 5 | Active-HIGH |
+| Speed 2 | 4 | Active-HIGH |
 | Ready button | 11 | Button to GND, active-LOW; internal pull-up |
 | Ready relay | 12 | Active-HIGH |
 | RS-485 DE and /RE | 13 | LOW receive, HIGH transmit; tie DE and /RE together |
