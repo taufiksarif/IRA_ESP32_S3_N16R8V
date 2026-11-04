@@ -23,10 +23,10 @@ All seven control outputs are active-HIGH in the sketch. Use suitable driver sta
 | Speed 0 | 6 | Active-HIGH |
 | Speed 1 | 5 | Active-HIGH |
 | Speed 2 | 4 | Active-HIGH |
-| Ready button | 11 | Button to GND, active-LOW; internal pull-up |
-| Ready relay | 12 | Active-HIGH |
+| Ready button | 14 | Button to GND, active-LOW; internal pull-up |
+| Ready relay | 11 | Active-HIGH |
 | RS-485 DE and /RE | 13 | LOW receive, HIGH transmit; tie DE and /RE together |
-| Buzzer relay | 14 | Active-HIGH |
+| Buzzer relay | 12 | Active-HIGH |
 | UART2 RX / TX | 16 / 17 | Connect to transceiver RO / DI respectively |
 | CAN TX / RX | 18 / 21 | Connect to a CAN transceiver, not directly to CANH/CANL |
 | Onboard addressable RGB LED | 48 | Default for the pictured revision; change `IRA_RGB_LED_PIN` to 38 if required by your board revision |

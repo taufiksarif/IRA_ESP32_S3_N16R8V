@@ -73,9 +73,9 @@ LiquidCrystal statusLcd(PIN_LCD_RS, PIN_LCD_EN, PIN_LCD_D4, PIN_LCD_D5, PIN_LCD_
 static constexpr uint32_t LCD_REFRESH_MS = 500;
 uint32_t lcdLastRefreshMs = 0;
 // Auxiliary I/O (verify final board header labeling and external driver wiring).
-static constexpr int PIN_READY_BUTTON = 11; // button to GND, active LOW
-static constexpr int PIN_READY_RELAY = 12;  // active-HIGH relay module: LOW=OFF, HIGH=ON
-static constexpr int PIN_BUZZER_RELAY = 14; // active-HIGH relay driver
+static constexpr int PIN_READY_BUTTON = 14; // button to GND, active LOW
+static constexpr int PIN_READY_RELAY = 11;  // active-HIGH relay module: LOW=OFF, HIGH=ON
+static constexpr int PIN_BUZZER_RELAY = 12; // active-HIGH relay driver
 static constexpr uint32_t BUZZER_PULSE_MS = 250UL;
 
 static constexpr gpio_num_t PIN_CAN_TX = GPIO_NUM_18;
