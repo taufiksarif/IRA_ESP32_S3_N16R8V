@@ -8,7 +8,7 @@ The Arduino sketch is [`ESP32-S3-N16R8V.ino`](ESP32-S3-N16R8V.ino). The included
 
 The pin assignments target the ESP32-S3 N16R8 board shown in the image. In Arduino IDE, select **ESP32-S3 Dev Module** or the exact board variant if installed. Configure **16 MB flash** and **8 MB OPI PSRAM** using the available board menu options.
 
-The sketch uses Arduino-ESP32 libraries, the Adafruit NeoPixel library, and the legacy ESP-IDF TWAI API from `driver/twai.h`. Install **Adafruit NeoPixel** through Arduino Library Manager. Select an Arduino-ESP32 core version that provides the legacy TWAI API; if your installed core has changed it, the TWAI calls may need an API update.
+The sketch uses Arduino-ESP32 libraries, the built-in **LiquidCrystal** library, the Adafruit NeoPixel library, and the legacy ESP-IDF TWAI API from `driver/twai.h`. Install **Adafruit NeoPixel** through Arduino Library Manager. Select an Arduino-ESP32 core version that provides the legacy TWAI API; if your installed core has changed it, the TWAI calls may need an API update.
 
 ## GPIO assignment
 
@@ -30,8 +30,17 @@ All seven control outputs are active-HIGH in the sketch. Use suitable driver sta
 | UART2 RX / TX | 16 / 17 | Connect to transceiver RO / DI respectively |
 | CAN TX / RX | 18 / 21 | Connect to a CAN transceiver, not directly to CANH/CANL |
 | Onboard addressable RGB LED | 48 | Default for the pictured revision; change `IRA_RGB_LED_PIN` to 38 if required by your board revision |
+| LCD RS | 1 | 16x2 character LCD, 4-bit mode |
+| LCD E | 2 | 16x2 character LCD, 4-bit mode |
+| LCD D4 / D5 / D6 / D7 | 15 / 39 / 40 / 41 | LCD data lines; leave D0–D3 unconnected |
 
 Check the RGB LED data pin against your exact board revision. The sketch assumes an addressable one-pixel LED on GPIO48, as on many N16R8 boards; some revisions use GPIO38. The `IRA_RGB_LED_PIN` constant is near the other pin assignments. The sketch sets a low brightness to limit LED current.
+
+### LCD wiring and display
+
+The sketch drives the pictured 16-pin parallel character LCD as a 16x2 HD44780-compatible display in 4-bit mode. Connect LCD RS, E, D4, D5, D6, and D7 to the GPIOs in the table. Connect RW to GND, and leave D0–D3 unconnected. Connect LCD VSS to GND, VDD to the supply specified for your exact LCD module, VO to the contrast potentiometer/wiper, and the backlight pins (A/K or BLA/BLK) according to the module markings. The display refreshes about twice per second with the current sequence step and remaining time, or idle/CAN status and AP client count. CAN faults take priority.
+
+Check the LCD's logic-level requirements before connecting it. ESP32 GPIOs are 3.3 V and are not 5 V tolerant; a 5 V LCD module may require level shifting on the six ESP32-to-LCD signal lines. Do not connect a 5 V LCD signal output to an ESP32 pin. The selected LCD pins leave GPIO38 unused for board revisions that use it for the onboard RGB LED.
 
 ## Features
 
@@ -43,6 +52,7 @@ Check the RGB LED data pin against your exact board revision. The sketch assumes
 - CAN/TWAI frame monitoring and manually initiated frame transmission through the protocol analyzer.
 - UART2 modes: Modbus RTU slave (unit ID 1), passive Modbus monitor, and raw UART text.
 - Live status, diagnostics, and a bounded analyzer event log.
+- Local 16x2 LCD status display for sequence progress, CAN faults, and AP clients.
 
 The RGB status LED blinks blue while no access-point client is connected, glows green when a client is connected and the controller is idle, glows amber during an automatic sequence, and glows red if the CAN driver is unavailable or the bus is off. Fault and sequence indications take priority over the Wi-Fi connection indication.
 

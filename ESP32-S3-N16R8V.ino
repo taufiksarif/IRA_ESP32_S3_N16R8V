@@ -35,6 +35,7 @@
 #include <DNSServer.h>
 #include <Preferences.h>
 #include <Adafruit_NeoPixel.h>
+#include <LiquidCrystal.h>
 #include "driver/twai.h"
 
 // ---------------- Wi-Fi ----------------
@@ -60,6 +61,17 @@ static constexpr int PIN_DOWN   = 7;  // Change from 7
 static constexpr int PIN_SPEED0 = 6;  // Change from 8
 static constexpr int PIN_SPEED1 = 5;  // Change from 9
 static constexpr int PIN_SPEED2 = 4; // Change from 10
+// 16x2 HD44780-compatible LCD, 4-bit mode. GPIO38 remains free for board
+// revisions that use it for the onboard RGB LED.
+static constexpr int PIN_LCD_RS = 1;
+static constexpr int PIN_LCD_EN = 2;
+static constexpr int PIN_LCD_D4 = 15;
+static constexpr int PIN_LCD_D5 = 39;
+static constexpr int PIN_LCD_D6 = 40;
+static constexpr int PIN_LCD_D7 = 41;
+LiquidCrystal statusLcd(PIN_LCD_RS, PIN_LCD_EN, PIN_LCD_D4, PIN_LCD_D5, PIN_LCD_D6, PIN_LCD_D7);
+static constexpr uint32_t LCD_REFRESH_MS = 500;
+uint32_t lcdLastRefreshMs = 0;
 // Auxiliary I/O (verify final board header labeling and external driver wiring).
 static constexpr int PIN_READY_BUTTON = 11; // button to GND, active LOW
 static constexpr int PIN_READY_RELAY = 12;  // active-HIGH relay module: LOW=OFF, HIGH=ON
@@ -1452,6 +1464,12 @@ void setup() {
     digitalWrite(OUTPUTS[i].pin, LOW);
     pinMode(OUTPUTS[i].pin, OUTPUT);
   }
+  statusLcd.begin(16, 2);
+  statusLcd.clear();
+  statusLcd.setCursor(0, 0);
+  statusLcd.print("IRA starting...");
+  statusLcd.setCursor(0, 1);
+  statusLcd.print("Please wait");
 
   stateMutex = xSemaphoreCreateMutex();
   controlStateMutex = xSemaphoreCreateMutex();
@@ -1547,5 +1565,36 @@ void setup() {
 void loop() {
   dnsServer.processNextRequest();
   server.handleClient();
+  const uint32_t now = millis();
+  if ((uint32_t)(now - lcdLastRefreshMs) >= LCD_REFRESH_MS) {
+    lcdLastRefreshMs = now;
+    String stepStatus;
+    uint32_t stepStartedMs, stepDurationMs;
+    getSequenceSnapshot(stepStatus, stepStartedMs, stepDurationMs);
+    const bool running = sequenceRunning;
+    const bool canFault = !canDriverReady || canBusState == 2;
+    String line1;
+    String line2;
+    if (canFault) {
+      line1 = "CAN BUS FAULT";
+      line2 = canBusState == 2 ? "Bus off" : "Driver stopped";
+    } else if (running) {
+      line1 = stepStatus;
+      const uint32_t elapsed = now - stepStartedMs;
+      const uint32_t remaining = stepDurationMs > elapsed ? stepDurationMs - elapsed : 0;
+      line2 = String("Step left ") + String((remaining + 999UL) / 1000UL) + "s";
+    } else {
+      line1 = canBusState == 1 ? "IDLE - CAN OK" : "IDLE - CAN WAIT";
+      line2 = String("AP clients: ") + String(WiFi.softAPgetStationNum());
+    }
+    line1 = line1.substring(0, 16);
+    line2 = line2.substring(0, 16);
+    while (line1.length() < 16) line1 += ' ';
+    while (line2.length() < 16) line2 += ' ';
+    statusLcd.setCursor(0, 0);
+    statusLcd.print(line1);
+    statusLcd.setCursor(0, 1);
+    statusLcd.print(line2);
+  }
   vTaskDelay(pdMS_TO_TICKS(2));
 }
