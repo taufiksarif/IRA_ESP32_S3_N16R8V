@@ -33,6 +33,7 @@ All seven control outputs are active-HIGH in the sketch. Use suitable driver sta
 | LCD RS | 1 | 16x2 character LCD, 4-bit mode |
 | LCD E | 2 | 16x2 character LCD, 4-bit mode |
 | LCD D4 / D5 / D6 / D7 | 15 / 39 / 40 / 41 | LCD data lines; leave D0–D3 unconnected |
+| Physical sequence reset button | 42 | Button to GND, active-LOW; internal pull-up; stops sequences and silences the post-Run-Mode buzzer; does not reboot the ESP32 |
 
 Check the RGB LED data pin against your exact board revision. The sketch assumes an addressable one-pixel LED on GPIO48, as on many N16R8 boards; some revisions use GPIO38. The `IRA_RGB_LED_PIN` constant is near the other pin assignments. The sketch sets a low brightness to limit LED current.
 
@@ -47,8 +48,10 @@ Check the LCD's logic-level requirements before connecting it. ESP32 GPIOs are 3
 - Wi-Fi access point and optional router connection. The dashboard is served at `http://10.10.10.10/` while connected to the device AP.
 - Manual controls for Brake, Enable, direction, and speed selections. Direction and speed are interlocked during automatic sequences.
 - Auto UP and Auto DOWN timed sequences, plus Run Mode that alternates direction until its configured duration expires.
+- Physical sequence reset button stops an active sequence, returns the sequence controller to idle (READY when CAN is healthy), and silences the post-Run-Mode buzzer. It does not reboot the ESP32.
 - Configurable timers stored in ESP32 NVS, including the ready-signal delay and Run Mode duration.
 - Ready button behavior: a debounced press starts the configured delay; the ready relay activates only while the button remains held. A raw release turns the relay off immediately.
+- The buzzer beeps twice for 2 seconds each when an access-point client connects. After Run Mode completes, it gives 2-second pulses at the configured interval until stopped.
 - CAN/TWAI frame monitoring and manually initiated frame transmission through the protocol analyzer.
 - UART2 modes: Modbus RTU slave (unit ID 1), passive Modbus monitor, and raw UART text.
 - Live status, diagnostics, and a bounded analyzer event log.

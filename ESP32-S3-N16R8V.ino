@@ -73,10 +73,11 @@ LiquidCrystal statusLcd(PIN_LCD_RS, PIN_LCD_EN, PIN_LCD_D4, PIN_LCD_D5, PIN_LCD_
 static constexpr uint32_t LCD_REFRESH_MS = 500;
 uint32_t lcdLastRefreshMs = 0;
 // Auxiliary I/O (verify final board header labeling and external driver wiring).
+static constexpr int PIN_RESET_BUTTON = 42; // button to GND, active LOW
 static constexpr int PIN_READY_BUTTON = 14; // button to GND, active LOW
 static constexpr int PIN_READY_RELAY = 11;  // active-HIGH relay module: LOW=OFF, HIGH=ON
 static constexpr int PIN_BUZZER_RELAY = 12; // active-HIGH relay driver
-static constexpr uint32_t BUZZER_PULSE_MS = 250UL;
+static constexpr uint32_t BUZZER_PULSE_MS = 2000UL;
 
 static constexpr gpio_num_t PIN_CAN_TX = GPIO_NUM_18;
 static constexpr gpio_num_t PIN_CAN_RX = GPIO_NUM_21;
@@ -267,6 +268,16 @@ volatile uint32_t canLastRxMs = 0;
 volatile uint32_t uartLastRxMs = 0;
 volatile uint8_t canBusState = 0; // 0=unknown/stopped, 1=running, 2=bus-off, 3=recovering
 volatile bool canDriverReady = false;
+portMUX_TYPE apJoinEventMux = portMUX_INITIALIZER_UNLOCKED;
+volatile uint8_t pendingApJoinEvents = 0;
+
+void handleWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
+  (void)info;
+  if (event != ARDUINO_EVENT_WIFI_AP_STACONNECTED) return;
+  portENTER_CRITICAL(&apJoinEventMux);
+  if (pendingApJoinEvents < 10) ++pendingApJoinEvents;
+  portEXIT_CRITICAL(&apJoinEventMux);
+}
 
 void addAnalyzerEvent(const char *source, const char *text) {
   if (!analyzerMutex) { ++analyzerDroppedLogs; return; }
@@ -677,8 +688,8 @@ const char INDEX_HTML[] PROGMEM =
   "<h3>Automatic sequences</h3><div class=\"controls\">\n"
   "<button class=\"seq\" id=\"autoUp\">Auto UP</button><button class=\"seq\" id=\"autoDown\">Auto DOWN</button>\n"
   "<button class=\"stop\" id=\"stopSeq\">Stop sequence / Run Mode</button>\n"
-  "</div><p class=\"muted\">Ready Signal: Switch to Timer; configured delay the relay turns ON. After Run Mode completes, the Buzzer relay pulses until Stop is pressed.</p><p id=\"seqStatus\" class=\"muted\">Sequence: Idle</p><div class=\"seq-progress\" aria-live=\"polite\"><div class=\"seq-progress-head\"><strong id=\"seqStepName\">Waiting for sequence</strong><span id=\"seqStepTime\">—</span></div><div class=\"seq-track\"><div id=\"seqProgressBar\" class=\"seq-fill\"></div></div><div class=\"seq-progress-foot\"><span id=\"seqDirection\">Direction: —</span><span id=\"seqStepDetail\">Step progress appears while running</span></div></div></div>\n"
-  "<details class=\"card collapsible\"><summary>Sequence timer settings</summary><div class=\"collapse-body\"><p class=\"muted\">Choose each sequence-step duration, Buzzer pulse interval, Ready Signal delay (1–600 seconds), and Run Mode duration (1–24 hours). Settings are saved to ESP32 nonvolatile memory (NVS). The buzzer pulses briefly every selected interval after Run Mode completes; Stop silences it.</p>\n"
+  "</div><p class=\"muted\">Ready Signal: Switch to Timer; configured delay the relay turns ON. The buzzer beeps twice for 2 seconds each when an access-point client connects. After Run Mode completes, the Buzzer relay gives 2-second pulses until Stop is pressed.</p><p id=\"seqStatus\" class=\"muted\">Sequence: Idle</p><div class=\"seq-progress\" aria-live=\"polite\"><div class=\"seq-progress-head\"><strong id=\"seqStepName\">Waiting for sequence</strong><span id=\"seqStepTime\">—</span></div><div class=\"seq-track\"><div id=\"seqProgressBar\" class=\"seq-fill\"></div></div><div class=\"seq-progress-foot\"><span id=\"seqDirection\">Direction: —</span><span id=\"seqStepDetail\">Step progress appears while running</span></div></div></div>\n"
+  "<details class=\"card collapsible\"><summary>Sequence timer settings</summary><div class=\"collapse-body\"><p class=\"muted\">Choose each sequence-step duration, Buzzer pulse interval, Ready Signal delay (1–600 seconds), and Run Mode duration (1–24 hours). Settings are saved to ESP32 nonvolatile memory (NVS). The buzzer gives a 2-second pulse every selected interval after Run Mode completes; Stop silences it.</p>\n"
   "<form id=\"timerForm\"><div id=\"timerFields\" class=\"controls\"></div><div class=\"actions\"><button type=\"submit\">Save sequence timers</button><button type=\"button\" id=\"reloadTimers\">Reload saved timers</button></div></form><p id=\"timerMessage\" class=\"muted\"></p></div></details>\n"
   "<details class=\"card collapsible\"><summary>Wi-Fi configuration</summary><div class=\"collapse-body\">\n"
   "<p class=\"muted\">Configure the ESP32 access point and optional router connection. Settings are saved in nonvolatile memory (NVS).</p>\n"
@@ -1156,6 +1167,12 @@ void controlTask(void *parameter) {
   bool buttonLastReading = HIGH;
   bool buttonStableState = HIGH;
   uint32_t buttonLastChangeMs = 0;
+  bool resetButtonLastReading = HIGH;
+  bool resetButtonStableState = HIGH;
+  uint32_t resetButtonLastChangeMs = 0;
+  uint8_t clientConnectBeepPulses = 0;
+  bool clientConnectBeepActive = false;
+  uint32_t clientConnectBeepNextMs = 0;
   auto allSpeedsOff = []() { applyOutputChanges((1UL << 4) | (1UL << 5) | (1UL << 6), 0); };
   auto setOnlySpeed = [](int index) { applyOutputChanges((1UL << 4) | (1UL << 5) | (1UL << 6), 1UL << index); };
   auto beginStage = [&](Stage next, uint32_t durationMs, const char *label) {
@@ -1170,6 +1187,18 @@ void controlTask(void *parameter) {
   for (;;) {
     controlHeartbeatMs = millis();
     const uint32_t now = millis();
+
+    // Drain AP station-connect events into the control task's two-beep queue.
+    uint8_t newApJoins = 0;
+    portENTER_CRITICAL(&apJoinEventMux);
+    newApJoins = pendingApJoinEvents;
+    pendingApJoinEvents = 0;
+    portEXIT_CRITICAL(&apJoinEventMux);
+    if (newApJoins) {
+      const uint8_t addedPulses = (uint8_t)(newApJoins * 2U);
+      const uint8_t room = (uint8_t)(20U - clientConnectBeepPulses);
+      clientConnectBeepPulses += addedPulses < room ? addedPulses : room;
+    }
 
     // READY SIGNAL STATE MACHINE:
     // 1) Startup state is OFF (active-HIGH relay: LOW = OFF).
@@ -1211,8 +1240,35 @@ void controlTask(void *parameter) {
       digitalWrite(PIN_READY_RELAY, HIGH); // active-HIGH relay ON
     }
 
+    // Debounced physical reset: use the same stop path as the dashboard Stop command.
+    const bool resetButtonReading = digitalRead(PIN_RESET_BUTTON);
+    if (resetButtonReading != resetButtonLastReading) {
+      resetButtonLastReading = resetButtonReading;
+      resetButtonLastChangeMs = now;
+    }
+    if ((uint32_t)(now - resetButtonLastChangeMs) >= 35UL &&
+        resetButtonStableState != resetButtonReading) {
+      resetButtonStableState = resetButtonReading;
+      if (resetButtonStableState == LOW) queueSequenceRequest(3);
+    }
+
+    // Client-join beeps take priority after any run-mode pulse already in progress.
+    if (clientConnectBeepActive) {
+      if ((int32_t)(now - buzzerPulseEndMs) >= 0) {
+        clientConnectBeepActive = false;
+        buzzerRelayOn = false;
+        digitalWrite(PIN_BUZZER_RELAY, LOW);
+        clientConnectBeepNextMs = now + BUZZER_PULSE_MS;
+      }
+    } else if (clientConnectBeepPulses && !buzzerRelayOn &&
+               (int32_t)(now - clientConnectBeepNextMs) >= 0) {
+      --clientConnectBeepPulses;
+      clientConnectBeepActive = true;
+      buzzerRelayOn = true;
+      buzzerPulseEndMs = now + BUZZER_PULSE_MS;
+      digitalWrite(PIN_BUZZER_RELAY, HIGH);
     // Brief buzzer relay pulse at a configurable interval after Run Mode completes.
-    if (buzzerAfterRunMode) {
+    } else if (buzzerAfterRunMode) {
       if (!buzzerRelayOn && (int32_t)(now - buzzerNextPulseMs) >= 0) {
         buzzerRelayOn = true;
         buzzerPulseEndMs = now + BUZZER_PULSE_MS;
@@ -1229,13 +1285,17 @@ void controlTask(void *parameter) {
 
     const uint8_t request = takeSequenceRequest();
     if (request == 3) {
-      stage = IDLE; setSequenceRunning(false); runModeActive = false; clearSequenceStep(); buzzerAfterRunMode = false; buzzerRelayOn = false; digitalWrite(PIN_BUZZER_RELAY, LOW);
+      stage = IDLE; setSequenceRunning(false); runModeActive = false; clearSequenceStep(); buzzerAfterRunMode = false;
+      if (!clientConnectBeepActive) { buzzerRelayOn = false; digitalWrite(PIN_BUZZER_RELAY, LOW); }
       // Stop all motion outputs and speed selections; de-energize outputs to a safe software state.
       applyOutputChanges((1UL << OUTPUT_COUNT) - 1UL, 0);
       setSequenceStatus("Stopped — outputs OFF");
     } else if ((request == 1 || request == 2 || request == 4) && stage == IDLE) {
       runModeActive = (request == 4);
-      if (runModeActive) { buzzerAfterRunMode = false; buzzerRelayOn = false; digitalWrite(PIN_BUZZER_RELAY, LOW); }
+      if (runModeActive) {
+        buzzerAfterRunMode = false;
+        if (!clientConnectBeepActive) { buzzerRelayOn = false; digitalWrite(PIN_BUZZER_RELAY, LOW); }
+      }
       runModeEndMs = runModeActive ? now + getSequenceTimerMs(T_RUN_MODE) : 0;
       beginCycle(request == 2 ? 3 : 2);
       if (runModeActive) setSequenceStatus(String("Run Mode: Auto UP (") + String(getSequenceTimerMs(T_RUN_MODE) / 3600000UL) + " hour(s))");
@@ -1454,6 +1514,7 @@ void failSafeHalt(const char *reason) {
 void setup() {
   // Safe software state from first initialization. For hazardous equipment,
   // external pull-downs / hardware interlocks are still required during reset.
+  pinMode(PIN_RESET_BUTTON, INPUT_PULLUP);
   pinMode(PIN_READY_BUTTON, INPUT_PULLUP);
   digitalWrite(PIN_MODBUS_DE, LOW);
   pinMode(PIN_MODBUS_DE, OUTPUT);
@@ -1500,6 +1561,7 @@ void setup() {
   if (apPassword.length() < 8 || apPassword.length() > 63) apPassword = DEFAULT_AP_PASSWORD;
 
   WiFi.mode(WIFI_AP_STA);
+  WiFi.onEvent(handleWiFiEvent);
   WiFi.setSleep(false);
   // Configure the AP address before starting the access point.
   if (!WiFi.softAPConfig(AP_IP, AP_GATEWAY, AP_SUBNET)) failSafeHalt("Access point IP configuration failed");
