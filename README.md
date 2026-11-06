@@ -33,7 +33,7 @@ All seven control outputs are active-HIGH in the sketch. Use suitable driver sta
 | LCD RS | 1 | 16x2 character LCD, 4-bit mode |
 | LCD E | 2 | 16x2 character LCD, 4-bit mode |
 | LCD D4 / D5 / D6 / D7 | 15 / 39 / 40 / 41 | LCD data lines; leave D0–D3 unconnected |
-| Physical sequence reset button | 47 | Normally-open button to GND, active-LOW; sketch internal pull-up; stops sequences and silences the post-Run-Mode buzzer; does not reboot the ESP32 |
+| Physical sequence reset button | 42 | Normally-open button to GND, active-LOW; sketch internal pull-up; stops sequences and silences the post-Run-Mode buzzer; does not reboot the ESP32 |
 
 Check the RGB LED data pin against your exact board revision. The pictured board uses GPIO48, and the sketch assumes that assignment. Some revisions use GPIO38. The `IRA_RGB_LED_PIN` constant is near the other pin assignments. The sketch sets a low brightness to limit LED current.
 
@@ -43,14 +43,14 @@ The sketch drives the pictured 16-pin parallel character LCD as a 16x2 HD44780-c
 
 Check the LCD's logic-level requirements before connecting it. ESP32 GPIOs are 3.3 V and are not 5 V tolerant; a 5 V LCD module may require level shifting on the six ESP32-to-LCD signal lines. Do not connect a 5 V LCD signal output to an ESP32 pin.
 
-Connect a normally-open reset switch between **GPIO47** and **GND**. The sketch enables its internal pull-up and treats LOW as pressed; an external pull-up is not required. Do not connect GPIO47 to an external 3.3 V or 5 V supply. In the dashboard, open **Diagnostics & controller health** to see the live GPIO47 level and debounced press count.
+Connect a normally-open reset switch between **GPIO42** and **GND**. The sketch enables its internal pull-up and treats LOW as pressed; an external pull-up is not required. Do not connect this input to 5 V. The sketch also reports its raw level and debounced press count in **Diagnostics & controller health**. A detected press displays a dashboard toast and stops the sequence, turns all seven control outputs off, and silences the post-Run-Mode buzzer. This is a sequence reset; it does not reboot the ESP32.
 
 ## Features
 
 - Wi-Fi access point and optional router connection. The dashboard is served at `http://10.10.10.10/` while connected to the device AP.
 - Manual controls for Brake, Enable, direction, and speed selections. Direction and speed are interlocked during automatic sequences.
 - Auto UP and Auto DOWN timed sequences, plus Run Mode that alternates direction until its configured duration expires.
-- Physical sequence reset button on GPIO47 stops an active sequence, returns the sequence controller to idle (READY when CAN is healthy), and silences the post-Run-Mode buzzer. It does not reboot the ESP32. When the dashboard is open, pressing it also displays a toast notification.
+- Physical sequence reset button on GPIO42 stops an active sequence, returns the sequence controller to idle (READY when CAN is healthy), and silences the post-Run-Mode buzzer. When the dashboard is open, pressing it also displays a toast notification.
 - Configurable timers stored in ESP32 NVS, including the ready-signal delay and Run Mode duration.
 - Ready button behavior: a debounced press starts the configured delay; the ready relay activates only while the button remains held. A raw release turns the relay off immediately.
 - The buzzer beeps twice for 2 seconds each when an access-point client connects. After Run Mode completes, it gives 2-second pulses at the configured interval until stopped.
@@ -58,6 +58,16 @@ Connect a normally-open reset switch between **GPIO47** and **GND**. The sketch 
 - UART2 modes: Modbus RTU slave (unit ID 1), passive Modbus monitor, and raw UART text.
 - Live status, diagnostics, and a bounded analyzer event log.
 - Local 16x2 LCD status display for sequence progress, CAN faults, and AP clients.
+
+### Control and diagnostic behavior
+
+- Run Mode completes its current automatic cycle before turning outputs off and starting the post-run buzzer. The dashboard Stop command and physical reset button stop the sequence immediately.
+- All seven manual outputs are locked while an automatic sequence is active.
+- The control task is monitored by the task watchdog. The dashboard diagnostics report task health and task stack headroom.
+- The UART2 receive buffer is 1 KB. Modbus framing resynchronizes after an idle gap; UART overrun events are counted.
+- CAN/TWAI receive processing drains multiple queued frames per pass. Driver access is synchronized during transmit, recovery, and bitrate or listen-only reconfiguration. Listen-only mode does not ACK or transmit.
+- Timer values are persisted through the main loop, outside the UART/Modbus receive path.
+- State-changing dashboard POST requests are restricted by a same-origin check. The dashboard still has no login.
 
 The RGB status LED blinks blue while no access-point client is connected, glows green when a client is connected and the controller is idle, glows amber during an automatic sequence, and glows red if the CAN driver is unavailable or the bus is off. Fault and sequence indications take priority over the Wi-Fi connection indication.
 

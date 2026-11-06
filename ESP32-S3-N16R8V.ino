@@ -12,12 +12,30 @@
   - GPIO0, GPIO3, GPIO45 and GPIO46 are ESP32-S3 strapping pins and are not
     assigned to control outputs.
   - The onboard addressable RGB LED is configured on GPIO48 for the pictured
-    board revision. GPIO47 is used for the physical sequence reset button.
+    board revision. GPIO42 is used for the physical sequence reset button.
   - Do not connect ESP32 GPIOs directly to CANH/CANL: use a 3.3-V-compatible
     CAN transceiver. CAN uses GPIO18 (TX), GPIO21 (RX); UART2 uses GPIO17 (TX),
     GPIO16 (RX), and GPIO13 for RS-485 DE and /RE.
   - Wi-Fi uses the existing default AP password and has no web login. This is not
     a safety controller. Wi-Fi security settings are intentionally unchanged.
+  - ESP32-S3 modules with 1.8 V octal flash/PSRAM (the "V" variants, e.g. N16R8V) power
+    GPIO47 and GPIO48 from the 1.8 V VDD_SPI rail. Check the module datasheet: a
+    WS2812-type RGB LED on GPIO48 may need a level shifter, so the reset
+    button was moved off GPIO47 to GPIO42 (3.3 V domain).
+  - When the router (STA) link is up, the AP is forced onto the router's Wi-Fi channel;
+    clients may briefly drop when that happens. This is an ESP32 single-radio limit.
+
+  Revision notes (review fixes):
+  - UART RX buffer 1 KB, read loop no longer limited by the log batch; overflow events counted.
+  - Modbus framers resynchronise after an idle gap; exception codes corrected.
+  - NVS access serialised with a mutex and moved out of the UART/Modbus path.
+  - CAN: deeper RX queue, multi-frame drain, mutex against driver restarts, monotonic
+    error counter, optional listen-only mode (no ACK, no transmit).
+  - Control task is on the task watchdog; stacks enlarged; high-water marks exposed.
+  - Run Mode finishes its current cycle instead of cutting outputs mid-ramp.
+  - All outputs (incl. Brake/Enable) are locked while an automatic sequence runs.
+  - Same-origin check on all state-changing POST requests (CSRF); no login added.
+  - Analyzer JSON is streamed (no large String), beep timer is rollover-safe.
 
   Arduino IDE board configuration:
     * Select an ESP32-S3 Dev Module (or the exact vendor board if available).
@@ -36,6 +54,7 @@
 #include <Adafruit_NeoPixel.h>
 #include <LiquidCrystal.h>
 #include "driver/twai.h"
+#include "esp_task_wdt.h"
 
 // ---------------- Wi-Fi ----------------
 static const char *DEFAULT_AP_SSID = "Repair Center";
@@ -49,17 +68,17 @@ static const char *PREF_NAMESPACE = "wifi-config";
 
 // ---------------- ESP32-S3 N16R8 GPIO assignment ----------------
 // Addressable onboard RGB LED data pin for the pictured board revision.
-// Verify against the schematic; GPIO47 is used by the physical reset button.
+// Verify against the schematic; GPIO42 is used by the physical reset button.
 static constexpr int IRA_RGB_LED_PIN = 48;
 
 // Seven active-HIGH control outputs, on header GPIOs available on the pictured board.
-static constexpr int PIN_BRAKE  = 10;  // Change from 4
-static constexpr int PIN_ENABLE = 9;  // Change from 5
-static constexpr int PIN_UP     = 8;  // Change from 6
-static constexpr int PIN_DOWN   = 7;  // Change from 7
-static constexpr int PIN_SPEED0 = 6;  // Change from 8
-static constexpr int PIN_SPEED1 = 5;  // Change from 9
-static constexpr int PIN_SPEED2 = 4; // Change from 10
+static constexpr int PIN_BRAKE  = 10;
+static constexpr int PIN_ENABLE = 9;
+static constexpr int PIN_UP     = 8;
+static constexpr int PIN_DOWN   = 7;
+static constexpr int PIN_SPEED0 = 6;
+static constexpr int PIN_SPEED1 = 5;
+static constexpr int PIN_SPEED2 = 4;
 // 16x2 HD44780-compatible LCD, 4-bit mode.
 static constexpr int PIN_LCD_RS = 1;
 static constexpr int PIN_LCD_EN = 2;
@@ -71,8 +90,9 @@ LiquidCrystal statusLcd(PIN_LCD_RS, PIN_LCD_EN, PIN_LCD_D4, PIN_LCD_D5, PIN_LCD_
 static constexpr uint32_t LCD_REFRESH_MS = 500;
 uint32_t lcdLastRefreshMs = 0;
 // Auxiliary I/O (verify final board header labeling and external driver wiring).
-// GPIO47 reset input; use the internal pull-up and a button from GPIO47 to GND.
-static constexpr int PIN_RESET_BUTTON = 47; // button to GND, active LOW
+// GPIO42 reset input (moved from GPIO47, which sits on the 1.8 V VDD_SPI rail on "V" modules).
+// Use the internal pull-up and a button from GPIO42 to GND. GPIO38 is a drop-in alternative.
+static constexpr int PIN_RESET_BUTTON = 42; // button to GND, active LOW
 static constexpr int PIN_READY_BUTTON = 14; // button to GND, active LOW
 static constexpr int PIN_READY_RELAY = 11;  // active-HIGH relay module: LOW=OFF, HIGH=ON
 static constexpr int PIN_BUZZER_RELAY = 12; // active-HIGH relay driver
@@ -85,6 +105,7 @@ static constexpr int PIN_UART_RX = 16;
 static constexpr int PIN_MODBUS_DE = 13; // RS-485 DE and /RE tied together; LOW=receive, HIGH=transmit
 static constexpr uint8_t MODBUS_SLAVE_ID = 1;
 static constexpr uint32_t DEFAULT_UART_BAUD = 115200;
+static constexpr size_t UART_RX_BUFFER_SIZE = 1024;
 uint32_t uartBaud = DEFAULT_UART_BAUD;
 uint32_t canBitrate = 500000;
 
@@ -94,6 +115,8 @@ static constexpr uint16_t DNS_PORT = 53;
 Preferences prefs;
 HardwareSerial ExternalSerial(2);
 SemaphoreHandle_t uartMutex;
+SemaphoreHandle_t prefsMutex; // serialises every Preferences (NVS) access
+SemaphoreHandle_t canMutex;   // serialises TWAI receive/transmit/restart
 volatile bool modbusModeEnabled = true;
 volatile bool passiveMonitorEnabled = false;
 volatile uint32_t uartModeGeneration = 0;
@@ -135,7 +158,6 @@ volatile uint32_t runModeEndMs = 0;
 String sequenceStatus = "Idle";
 volatile uint32_t sequenceStepStartedMs = 0;
 volatile uint32_t sequenceStepDurationMs = 0;
-volatile uint32_t sequenceStepRemainingMs = 0;
 volatile uint32_t lastCanTransmitMs = 0;
 volatile uint32_t controlHeartbeatMs = 0;
 TaskHandle_t controlTaskHandle = nullptr;
@@ -168,6 +190,63 @@ void setSequenceTimerMs(size_t index, uint32_t value) {
   xSemaphoreGive(timerMutex);
 }
 
+// ---- NVS helpers: every Preferences access goes through prefsMutex ----
+bool prefsPutUInt(const char *ns, const char *key, uint32_t value) {
+  if (!prefsMutex || xSemaphoreTake(prefsMutex, portMAX_DELAY) != pdTRUE) return false;
+  const bool ok = prefs.begin(ns, false);
+  if (ok) { prefs.putUInt(key, value); prefs.end(); }
+  xSemaphoreGive(prefsMutex);
+  return ok;
+}
+
+bool prefsPutTwoStrings(const char *ns, const char *k1, const String &v1, const char *k2, const String &v2) {
+  if (!prefsMutex || xSemaphoreTake(prefsMutex, portMAX_DELAY) != pdTRUE) return false;
+  const bool ok = prefs.begin(ns, false);
+  if (ok) { prefs.putString(k1, v1); prefs.putString(k2, v2); prefs.end(); }
+  xSemaphoreGive(prefsMutex);
+  return ok;
+}
+
+// Timer changes (web or Modbus) only mark a bit; the Arduino loop task writes them to NVS.
+// This keeps flash writes out of the UART/Modbus path (which holds uartMutex).
+portMUX_TYPE timerDirtyMux = portMUX_INITIALIZER_UNLOCKED;
+volatile uint32_t timerDirtyMask = 0;
+
+void markTimerDirty(size_t index) {
+  if (index >= TIMER_COUNT) return;
+  portENTER_CRITICAL(&timerDirtyMux);
+  timerDirtyMask |= (1UL << index);
+  portEXIT_CRITICAL(&timerDirtyMux);
+}
+
+void flushDirtyTimers() {
+  if (!timerDirtyMask) return;
+  uint32_t mask;
+  portENTER_CRITICAL(&timerDirtyMux);
+  mask = timerDirtyMask;
+  timerDirtyMask = 0;
+  portEXIT_CRITICAL(&timerDirtyMux);
+  if (!mask) return;
+  bool ok = false;
+  if (prefsMutex && xSemaphoreTake(prefsMutex, portMAX_DELAY) == pdTRUE) {
+    if (prefs.begin("seq-timers", false)) {
+      for (size_t i = 0; i < TIMER_COUNT; ++i) {
+        if (!(mask & (1UL << i))) continue;
+        const uint32_t ms = getSequenceTimerMs(i);
+        prefs.putUInt(TIMER_KEYS[i], i == T_RUN_MODE ? ms / 3600000UL : ms / 1000UL);
+      }
+      prefs.end();
+      ok = true;
+    }
+    xSemaphoreGive(prefsMutex);
+  }
+  if (!ok) { // try again on the next loop pass
+    portENTER_CRITICAL(&timerDirtyMux);
+    timerDirtyMask |= mask;
+    portEXIT_CRITICAL(&timerDirtyMux);
+  }
+}
+
 void getSequenceSnapshot(String &status, uint32_t &stepStartedMs, uint32_t &stepDurationMs) {
   status = "Unavailable";
   stepStartedMs = millis();
@@ -187,13 +266,13 @@ void setSequenceStatus(const String &status) {
   }
 }
 
-bool queueSequenceRequest(uint8_t request, bool allowReplaceStop = false) {
+bool queueSequenceRequest(uint8_t request) {
   bool accepted = false;
   portENTER_CRITICAL(&sequenceRequestMux);
   if (request == 3) {
     sequenceRequest = 3;
     accepted = true;
-  } else if ((!sequenceRunning && sequenceRequest == 0) || (allowReplaceStop && sequenceRequest == 3)) {
+  } else if (!sequenceRunning && sequenceRequest == 0) {
     sequenceRequest = request;
     accepted = true;
   }
@@ -220,7 +299,6 @@ void updateSequenceStep(uint32_t started, uint32_t duration, const String &statu
   if (controlStateMutex && xSemaphoreTake(controlStateMutex, portMAX_DELAY) == pdTRUE) {
     sequenceStepStartedMs = started;
     sequenceStepDurationMs = duration;
-    sequenceStepRemainingMs = duration;
     sequenceStatus = status;
     xSemaphoreGive(controlStateMutex);
   }
@@ -229,7 +307,6 @@ void updateSequenceStep(uint32_t started, uint32_t duration, const String &statu
 void clearSequenceStep() {
   if (controlStateMutex && xSemaphoreTake(controlStateMutex, portMAX_DELAY) == pdTRUE) {
     sequenceStepDurationMs = 0;
-    sequenceStepRemainingMs = 0;
     xSemaphoreGive(controlStateMutex);
   }
 }
@@ -237,7 +314,6 @@ String staSSID;
 String staPassword;
 volatile uint32_t canRxCount = 0;
 volatile uint32_t uartRxCount = 0;
-String lastUartLine;
 volatile uint32_t modbusRxCount = 0;
 volatile uint32_t modbusErrorCount = 0;
 volatile uint16_t modbusLastCommand = 0;
@@ -268,6 +344,9 @@ volatile uint32_t canLastRxMs = 0;
 volatile uint32_t uartLastRxMs = 0;
 volatile uint8_t canBusState = 0; // 0=unknown/stopped, 1=running, 2=bus-off, 3=recovering
 volatile bool canDriverReady = false;
+volatile bool canListenOnly = false;     // true = TWAI listen-only (no ACK, no TX)
+volatile bool canRecoveryPending = false;
+volatile uint8_t sequenceDirection = 0;  // 0=none, 1=UP, 2=DOWN
 portMUX_TYPE apJoinEventMux = portMUX_INITIALIZER_UNLOCKED;
 volatile uint8_t pendingApJoinEvents = 0;
 
@@ -302,7 +381,7 @@ int outputIndexForName(const String &name) {
 }
 
 bool applyOutputChanges(uint32_t mask, uint32_t values) {
-  if (!stateMutex || xSemaphoreTake(stateMutex, pdMS_TO_TICKS(50)) != pdTRUE) return false;
+  if (!stateMutex || xSemaphoreTake(stateMutex, portMAX_DELAY) != pdTRUE) return false;
   for (size_t i = 0; i < OUTPUT_COUNT; ++i) {
     if (mask & (1UL << i)) outputState[i] = (values & (1UL << i)) != 0;
   }
@@ -317,7 +396,7 @@ void setOutputState(size_t index, bool state) {
 }
 
 void copyOutputStates(bool *dst) {
-  if (stateMutex && xSemaphoreTake(stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+  if (stateMutex && xSemaphoreTake(stateMutex, portMAX_DELAY) == pdTRUE) {
     for (size_t i = 0; i < OUTPUT_COUNT; ++i) dst[i] = outputState[i];
     xSemaphoreGive(stateMutex);
   }
@@ -341,13 +420,31 @@ String jsonEscape(const String &in) {
   return out;
 }
 
+// Escape into a fixed buffer (no heap). Worst case is 6 output bytes per input byte.
+static void jsonEscapeTo(char *dst, size_t cap, const char *src) {
+  static const char HEX_DIGITS[] = "0123456789ABCDEF";
+  size_t o = 0;
+  for (size_t i = 0; src[i] && o + 7 < cap; ++i) {
+    const uint8_t c = (uint8_t)src[i];
+    if (c == '"' || c == '\\') { dst[o++] = '\\'; dst[o++] = (char)c; }
+    else if (c == '\n') { dst[o++] = '\\'; dst[o++] = 'n'; }
+    else if (c == '\r') { dst[o++] = '\\'; dst[o++] = 'r'; }
+    else if (c == '\t') { dst[o++] = '\\'; dst[o++] = 't'; }
+    else if (c < 0x20) { memcpy(dst + o, "\\u00", 4); o += 4; dst[o++] = HEX_DIGITS[c >> 4]; dst[o++] = HEX_DIGITS[c & 0x0F]; }
+    else dst[o++] = (char)c;
+  }
+  dst[o] = 0;
+}
+
 String makeStatusJson(bool includeDiagnostics = true) {
-  bool states[OUTPUT_COUNT];
+  bool states[OUTPUT_COUNT] = {};
   copyOutputStates(states);
   String sequenceStatusCopy;
   uint32_t sequenceStartedCopy, sequenceDurationCopy;
   getSequenceSnapshot(sequenceStatusCopy, sequenceStartedCopy, sequenceDurationCopy);
-  String json = "{\"apSsid\":\"" + jsonEscape(apSSID) + "\",\"apIp\":\"" + WiFi.softAPIP().toString();
+  String json;
+  json.reserve(1900);
+  json = "{\"apSsid\":\"" + jsonEscape(apSSID) + "\",\"apIp\":\"" + WiFi.softAPIP().toString();
   json += "\",\"staConnected\":";
   json += (WiFi.status() == WL_CONNECTED) ? "true" : "false";
   json += ",\"staIp\":\"" + WiFi.localIP().toString() + "\",\"apClients\":" + String(WiFi.softAPgetStationNum());
@@ -365,6 +462,8 @@ String makeStatusJson(bool includeDiagnostics = true) {
   json += ",\"modbusFrames\":" + String(modbusRxCount) + ",\"modbusErrors\":" + String(modbusErrorCount);
   json += ",\"uartMode\":\"" + String(modbusModeEnabled ? "modbus" : (passiveMonitorEnabled ? "monitor" : "raw")) + "\"";
   json += ",\"canDriverReady\":" + String(canDriverReady ? "true" : "false");
+  json += ",\"canListenOnly\":" + String(canListenOnly ? "true" : "false");
+  json += ",\"sequenceDirection\":\"" + String(sequenceRunning ? (sequenceDirection == 1 ? "UP" : (sequenceDirection == 2 ? "DOWN" : "")) : "") + "\"";
   json += ",\"freeHeap\":" + String(ESP.getFreeHeap());
   json += ",\"minFreeHeap\":" + String(ESP.getMinFreeHeap());
   json += ",\"sequenceRunning\":" + String(sequenceRunning ? "true" : "false");
@@ -388,8 +487,10 @@ String makeStatusJson(bool includeDiagnostics = true) {
   json += ",\"controlHeartbeatAgeMs\":" + String(millis() - controlHeartbeatMs);
   json += ",\"controlTaskHealthy\":" + String((millis() - controlHeartbeatMs) < 500 ? "true" : "false");
   json += ",\"controlStackHighWaterWords\":" + String(controlTaskHandle ? uxTaskGetStackHighWaterMark(controlTaskHandle) : 0);
+  json += ",\"commsStackHighWaterWords\":" + String(communicationTaskHandle ? uxTaskGetStackHighWaterMark(communicationTaskHandle) : 0);
+  json += ",\"ledStackHighWaterWords\":" + String(statusLedTaskHandle ? uxTaskGetStackHighWaterMark(statusLedTaskHandle) : 0);
   size_t diagCount = 0;
-  if (includeDiagnostics && analyzerMutex && xSemaphoreTake(analyzerMutex, pdMS_TO_TICKS(2)) == pdTRUE) { diagCount = analyzerCount; xSemaphoreGive(analyzerMutex); }
+  if (analyzerMutex && xSemaphoreTake(analyzerMutex, pdMS_TO_TICKS(2)) == pdTRUE) { diagCount = analyzerCount; xSemaphoreGive(analyzerMutex); }
   json += ",\"analyzerCount\":" + String(diagCount) + ",\"analyzerCapacity\":" + String(ANALYZER_LOG_CAPACITY);
   }
   json += ",\"outputs\":{";
@@ -483,9 +584,7 @@ bool modbusSetTimer(uint16_t address, uint16_t value) {
   if (value < 1 || value > maxValue) return false;
   const uint32_t timerMs = index == T_RUN_MODE ? (uint32_t)value * 3600000UL : (uint32_t)value * 1000UL;
   setSequenceTimerMs(index, timerMs);
-  prefs.begin("seq-timers", false);
-  prefs.putUInt(TIMER_KEYS[index], value);
-  prefs.end();
+  markTimerDirty(index); // persisted later by the loop task
   return true;
 }
 
@@ -518,7 +617,14 @@ void modbusProcessFrame(const uint8_t *frame, size_t length) {
     const uint16_t address = ((uint16_t)frame[2] << 8) | frame[3];
     const uint16_t value = ((uint16_t)frame[4] << 8) | frame[5];
     bool ok = address == 0 ? modbusSetCommand(value) : modbusSetTimer(address, value);
-    if (!ok) { modbusException(function, address == 0 ? (value > 3 ? 3 : 6) : 3); return; }
+    if (!ok) {
+      uint8_t code;
+      if (address == 0) code = value > 3 ? 3 : 6;                                  // bad value / server busy
+      else if (address >= MODBUS_TIMER_BASE && address < MODBUS_TIMER_BASE + TIMER_COUNT) code = 3; // bad value
+      else code = 2;                                                                // read-only / unknown address
+      modbusException(function, code);
+      return;
+    }
     modbusSend(frame, 6);
     return;
   }
@@ -659,6 +765,7 @@ const char INDEX_HTML[] PROGMEM =
   ".dashboard{grid-template-columns:1fr;gap:10px;margin:14px 0 8px}.dashboard-metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px}.dashboard .dash-pill{border-radius:16px;background:var(--panel);box-shadow:inset 0 1px 0 rgba(255,255,255,.05);padding:11px 13px}.status-hero{min-height:72px;padding:14px 16px!important;border-radius:18px!important;background:linear-gradient(120deg,var(--card-top),var(--panel))!important}.status-hero .dash-icon{width:40px;height:40px;flex-basis:40px;font-size:18px}.status-hero .dash-value{font-size:1.08rem}@media(max-width:760px){.dashboard-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:420px){.dashboard .dash-pill{padding:10px}.dashboard-metrics{gap:7px}}@media(max-width:340px){.dashboard-metrics{grid-template-columns:1fr}}.top-actions{display:flex;align-items:center;gap:clamp(6px,1vw,10px);flex:0 1 auto}.status-hero{height:44px;min-height:44px!important;padding:5px 11px!important;border-radius:999px!important;background:linear-gradient(180deg,var(--card-top),var(--card-bottom))!important;box-shadow:0 4px 0 rgba(0,0,0,.12),inset 0 1px 0 rgba(255,255,255,.1);gap:7px;flex:0 1 205px}.status-hero .dash-icon{width:27px;height:27px;flex:0 0 27px;font-size:14px}.status-hero .dash-copy{gap:0}.status-hero .dash-label{font-size:.55rem;letter-spacing:.045em}.status-hero .dash-value{font-size:.78rem;line-height:1.05}@media(max-width:620px){.top-actions{width:100%;justify-content:center;flex-wrap:wrap}.status-hero{flex:0 1 205px}}@media(max-width:420px){.top-actions{gap:7px}.status-hero{flex:1 1 160px;max-width:205px}}@media(max-width:340px){.top-actions{gap:5px}.status-hero{max-width:175px}}.top-actions{align-items:center}.status-hero{width:max-content;flex:0 0 auto;max-width:none}.output-controls{grid-template-columns:repeat(2,minmax(0,1fr))}.connection-line{display:flex;align-items:center;gap:7px;min-height:18px;margin:6px 2px 12px;color:var(--muted);font-size:.78rem}.connection-dot{width:8px;height:8px;flex:0 0 8px;border-radius:50%;background:#e8b322}.connection-line.live .connection-dot{background:#37d878;box-shadow:0 0 10px rgba(55,216,120,.45)}.connection-line.offline{color:#f04452}.connection-line.offline .connection-dot{background:#f04452}.manual-lock{margin:8px 0;padding:9px 12px;border-radius:12px;border:1px solid rgba(232,179,34,.28);background:rgba(232,179,34,.08);color:var(--muted);font-size:.84rem}@media(max-width:620px){main{padding-bottom:82px}#stopSeq{position:fixed;z-index:999;left:12px;right:12px;bottom:calc(10px + env(safe-area-inset-bottom));width:auto;min-height:48px;border-radius:16px;box-shadow:0 8px 24px rgba(0,0,0,.38),0 4px 0 #741326}}.top-actions{flex-wrap:nowrap;white-space:nowrap}@media(max-width:620px){.top-actions{width:100%;justify-content:space-between;flex-wrap:nowrap}}@media(max-width:420px){.top-actions{gap:5px}.top-actions .theme-toggle{padding:7px 9px;font-size:.82rem;gap:5px}.status-hero{padding:5px 8px!important;gap:4px}.status-hero .dash-icon{width:22px;height:22px;flex-basis:22px}.status-hero .dash-copy{flex-direction:row;align-items:baseline;gap:4px}.status-hero .dash-label{font-size:.48rem;letter-spacing:.02em}.status-hero .dash-value{font-size:.73rem}}@media(max-width:360px){#themeLabel{display:none}.top-actions .theme-toggle{padding:7px 8px}}\n"
   "@media(max-width:420px){main{padding:12px}.controls{grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}.controls #stopSeq{grid-column:1/-1}.controls button{min-height:43px;padding:10px 8px;font-size:.88rem}.actions button{flex:1 1 145px}.card{border-radius:18px}.topbar{align-items:flex-start}.theme-toggle{min-height:40px;padding:8px 11px;font-size:.9rem}}\n"
   ".toast{position:fixed;z-index:10000;top:max(18px,env(safe-area-inset-top));right:max(16px,env(safe-area-inset-right));width:min(310px,calc(100vw - 32px));padding:13px 16px;border:1px solid rgba(127,235,177,.42);border-radius:14px;background:linear-gradient(145deg,rgba(17,54,39,.97),rgba(5,27,19,.97));color:#eafff1;box-shadow:0 14px 34px rgba(0,0,0,.32),inset 0 1px 0 rgba(255,255,255,.12);font-size:.92rem;font-weight:700;line-height:1.4;display:flex;align-items:center;gap:10px;opacity:0;transform:translateX(115%);pointer-events:none;transition:transform .34s cubic-bezier(.2,.8,.2,1),opacity .3s ease}.toast.show{opacity:1;transform:translateX(0)}.toast.hide{opacity:0;transform:translateX(115%)}.toast:before{content:\"✓\";width:23px;height:23px;flex:0 0 23px;border-radius:50%;display:grid;place-items:center;background:rgba(61,214,128,.2);color:#64ed9a}.toast.warn:before{content:\"!\";background:rgba(255,196,43,.2);color:#ffd34f}:root[data-theme=\"light\"] .toast{background:linear-gradient(145deg,rgba(247,255,249,.98),rgba(225,245,231,.98));color:#173727;border-color:#a5d9b4}\n"
+  ".table-wrap{overflow-x:auto}table{width:100%;border-collapse:collapse}th,td{border:1px solid var(--line);padding:7px 9px;text-align:left;font-size:.85rem}th{color:var(--label)}\n"
   "@media(prefers-reduced-motion:reduce){button,.theme-toggle,body,.toast{transition:none}}\n"
   "</style></head><body><div id=\"toast\" class=\"toast\" role=\"status\" aria-live=\"polite\"></div><main>\n"
   "<div id=\"fullBrowserPrompt\" style=\"display:none;position:sticky;top:0;z-index:9999;margin:0 0 12px;padding:12px;border:1px solid #2fa36b;border-radius:12px;background:#10251d;color:#eafff3;box-shadow:0 4px 16px #0005\">\n"
@@ -686,7 +793,7 @@ const char INDEX_HTML[] PROGMEM =
   "<button data-name=\"Up\">Up</button><button data-name=\"Down\">Down</button>\n"
   "<button data-name=\"Speed 0\">Speed 0</button><button data-name=\"Speed 1\">Speed 1</button>\n"
   "<button data-name=\"Speed 2\">Speed 2</button><button class=\"run\" id=\"runMode\">Run Mode (1 hour)</button></div>\n"
-  "<p id=\"manualLockNotice\" class=\"manual-lock\" hidden>Direction and speed controls are locked during an automatic sequence.</p>\n"
+  "<p id=\"manualLockNotice\" class=\"manual-lock\" hidden>Output controls are locked during an automatic sequence. Press Stop to abort.</p>\n"
   "<h3>Automatic sequences</h3><div class=\"controls\">\n"
   "<button class=\"seq\" id=\"autoUp\">Auto UP</button><button class=\"seq\" id=\"autoDown\">Auto DOWN</button>\n"
   "<button class=\"stop\" id=\"stopSeq\">Stop sequence / Run Mode</button>\n"
@@ -707,16 +814,16 @@ const char INDEX_HTML[] PROGMEM =
   "<label for=\"ssid\">Router SSID</label><input id=\"ssid\" name=\"ssid\" maxlength=\"32\" autocomplete=\"off\" placeholder=\"Wi-Fi network name\">\n"
   "<label for=\"password\">Router password</label><input id=\"password\" name=\"password\" type=\"password\" maxlength=\"64\" autocomplete=\"new-password\" placeholder=\"Leave blank for an open router\">\n"
   "<div class=\"actions\"><button type=\"submit\">Save &amp; reconnect router</button></div></form>\n"
-  "<p class=\"warn\">Changing AP settings disconnects connected clients. Reconnect using the new network name and password. The default password is 12345678; change it for your bench.</p></div></details>\n"
+  "<p class=\"warn\">Changing AP settings disconnects connected clients. Reconnect using the new network name and password. The default password is 12345678; change it for your bench. While the router connection is active the access point is forced onto the router's Wi-Fi channel, so clients may briefly drop when the router link comes up.</p></div></details>\n"
   "<details class=\"card collapsible\"><summary>Status</summary><div class=\"collapse-body\"><div id=\"status\" class=\"status\">Loading…</div></div></details>\n"
   "<details class=\"card collapsible\"><summary>Modbus RTU slave register map</summary><div class=\"collapse-body\"><p class=\"muted\">UART2 offers Modbus RTU slave, Passive Monitor, and Raw UART text modes. Only one is active at a time; choose in Protocol Analyzer. Passive Monitor never transmits. Use an RS-485 transceiver; connect its RO to GPIO16, DI to GPIO17, and tied DE+/RE to GPIO13. Configure your master to match the UART baud shown in Protocol Analyzer.</p><div class=\"table-wrap\"><table><thead><tr><th>Holding register</th><th>Meaning</th><th>Access / values</th></tr></thead><tbody><tr><td>0</td><td>Sequence command / last command</td><td>Read/write: 0 stop, 1 up, 2 down, 3 run</td></tr><tr><td>1</td><td>Sequence status</td><td>Read: 0 idle, 1 sequence, 2 run mode</td></tr><tr><td>2</td><td>Output bitfield</td><td>Read: bits 0–6 = Brake, Enable, Up, Down, Speed 0, Speed 1, Speed 2</td></tr><tr><td>3</td><td>Current step time remaining</td><td>Read, seconds</td></tr><tr><td>16–28 (0x0010–0x001C)</td><td>Sequence timer settings</td><td>Read/write: seconds, except Run Mode duration in hours</td></tr></tbody></table></div><p class=\"muted\">Supported functions: 03 read holding registers, 06 write single register, and 16 (0x10) write multiple timer registers. Timer writes are saved to NVS. Function 16 is for timers; use function 06 for commands.</p></div></details>\n"
-  "<details class=\"card collapsible\" id=\"diagnosticsPanel\"><summary>Diagnostics &amp; controller health</summary><div class=\"collapse-body\"><p class=\"muted\">Read-only health snapshot, refreshed with the dashboard. These checks report software and interface status; they do not verify external relay contacts or inverter safety.</p><div class=\"diagnostics-grid\"><div class=\"diag-tile\"><span>Control task</span><strong id=\"diagControl\">Checking…</strong><small id=\"diagControlDetail\">Heartbeat</small></div><div class=\"diag-tile\"><span>Physical reset input (GPIO47)</span><strong id=\"diagReset\">—</strong><small id=\"diagResetDetail\">Raw input · press count</small></div><div class=\"diag-tile\"><span>Minimum free heap</span><strong id=\"diagHeap\">—</strong><small id=\"diagHeapDetail\">Since boot</small></div><div class=\"diag-tile\"><span>Wi-Fi access point</span><strong id=\"diagWifi\">—</strong><small id=\"diagWifiDetail\">Clients</small></div><div class=\"diag-tile\"><span>Router Wi-Fi (STA)</span><strong id=\"diagSta\">—</strong><small id=\"diagStaDetail\">IP status</small></div><div class=\"diag-tile\"><span>CAN / TWAI</span><strong id=\"diagCan\">—</strong><small id=\"diagCanDetail\">Driver and errors</small></div><div class=\"diag-tile\"><span>Analyzer buffer</span><strong id=\"diagBuffer\">—</strong><small id=\"diagBufferDetail\">Bounded ring buffer</small></div><div class=\"diag-tile\"><span>Control stack headroom</span><strong id=\"diagStack\">—</strong><small>FreeRTOS stack high-water mark</small></div><div class=\"diag-tile\"><span>Log losses</span><strong id=\"diagLoss\">—</strong><small id=\"diagLossDetail\">Overwrites / dropped UART bytes</small></div></div><p class=\"muted\" id=\"diagUpdated\">Waiting for first status update…</p></div></details>\n"
+  "<details class=\"card collapsible\" id=\"diagnosticsPanel\"><summary>Diagnostics &amp; controller health</summary><div class=\"collapse-body\"><p class=\"muted\">Read-only health snapshot, refreshed with the dashboard. These checks report software and interface status; they do not verify external relay contacts or inverter safety.</p><div class=\"diagnostics-grid\"><div class=\"diag-tile\"><span>Control task</span><strong id=\"diagControl\">Checking…</strong><small id=\"diagControlDetail\">Heartbeat</small></div><div class=\"diag-tile\"><span>Physical reset input (GPIO42)</span><strong id=\"diagReset\">—</strong><small id=\"diagResetDetail\">Raw input · press count</small></div><div class=\"diag-tile\"><span>Minimum free heap</span><strong id=\"diagHeap\">—</strong><small id=\"diagHeapDetail\">Since boot</small></div><div class=\"diag-tile\"><span>Wi-Fi access point</span><strong id=\"diagWifi\">—</strong><small id=\"diagWifiDetail\">Clients</small></div><div class=\"diag-tile\"><span>Router Wi-Fi (STA)</span><strong id=\"diagSta\">—</strong><small id=\"diagStaDetail\">IP status</small></div><div class=\"diag-tile\"><span>CAN / TWAI</span><strong id=\"diagCan\">—</strong><small id=\"diagCanDetail\">Driver and errors</small></div><div class=\"diag-tile\"><span>Analyzer buffer</span><strong id=\"diagBuffer\">—</strong><small id=\"diagBufferDetail\">Bounded ring buffer</small></div><div class=\"diag-tile\"><span>Control stack headroom</span><strong id=\"diagStack\">—</strong><small>FreeRTOS stack high-water mark</small></div><div class=\"diag-tile\"><span>Log losses</span><strong id=\"diagLoss\">—</strong><small id=\"diagLossDetail\">Overwrites / dropped UART bytes</small></div></div><p class=\"muted\" id=\"diagUpdated\">Waiting for first status update…</p></div></details>\n"
   "<section class=\"card\" id=\"analyzerView\" hidden>\n"
   "<div class=\"analyzer-head\"><div><h2>Protocol Analyzer</h2><p class=\"muted\">Buffered live receive monitor · timestamps are milliseconds since ESP32 boot</p></div><button type=\"button\" id=\"backDashboard\">← Back to Dashboard</button></div>\n"
   "<div class=\"analyzer-stats\"><div class=\"dash-pill\"><span class=\"dash-copy\"><span class=\"dash-label\">CAN RX frames</span><span class=\"dash-value\" id=\"anCanCount\">0</span></span></div><div class=\"dash-pill\"><span class=\"dash-copy\"><span class=\"dash-label\">Modbus RX frames</span><span class=\"dash-value\" id=\"anUartCount\">0</span></span></div><div class=\"dash-pill\"><span class=\"dash-copy\"><span class=\"dash-label\">CAN bus state</span><span class=\"dash-value\" id=\"anCanState\">Unknown</span></span></div><div class=\"dash-pill\"><span class=\"dash-copy\"><span class=\"dash-label\">CAN errors</span><span class=\"dash-value\" id=\"anCanErrors\">0</span></span></div><div class=\"dash-pill\"><span class=\"dash-copy\"><span class=\"dash-label\">Dropped log records</span><span class=\"dash-value\" id=\"anDropped\">0</span></span></div><div class=\"dash-pill\"><span class=\"dash-copy\"><span class=\"dash-label\">Last RX age</span><span class=\"dash-value\" id=\"anLastRx\">Never</span></span></div></div>\n"
   "<div class=\"analyzer-tabs\"><button type=\"button\" class=\"tab active\" data-an-tab=\"can\">CAN Console</button><button type=\"button\" class=\"tab\" data-an-tab=\"serial\">UART / Modbus</button></div>\n"
   "<div class=\"analyzer-toolbar\"><label class=\"checklabel\"><input type=\"checkbox\" id=\"anPause\"> Pause display</label><label class=\"checklabel\"><input type=\"checkbox\" id=\"anHex\" checked> Hex / raw view</label><label for=\"anFilter\">Filter text / CAN ID</label><input id=\"anFilter\" type=\"search\" maxlength=\"64\" placeholder=\"e.g. 0x123 or RX HEX\" style=\"max-width:240px\"><button type=\"button\" id=\"anRecord\">Start recording</button><span id=\"anRecordState\" class=\"recording-indicator\">Not recording</span><button type=\"button\" id=\"anClear\">Clear display</button><button type=\"button\" id=\"anExportTxt\">Export TXT</button><button type=\"button\" id=\"anExportCsv\">Export CSV</button></div>\n"
-  "<div class=\"analyzer-toolbar\" id=\"canRateRow\"><label for=\"canRate\">CAN bitrate</label><select id=\"canRate\"><option value=\"125000\">125 kbit/s</option><option value=\"250000\">250 kbit/s</option><option value=\"500000\" selected>500 kbit/s</option><option value=\"1000000\">1 Mbit/s</option></select><button type=\"button\" id=\"applyCanRate\">Apply CAN bitrate</button></div>\n"
+  "<div class=\"analyzer-toolbar\" id=\"canRateRow\"><label for=\"canRate\">CAN bitrate</label><select id=\"canRate\"><option value=\"125000\">125 kbit/s</option><option value=\"250000\">250 kbit/s</option><option value=\"500000\" selected>500 kbit/s</option><option value=\"1000000\">1 Mbit/s</option></select><button type=\"button\" id=\"applyCanRate\">Apply CAN bitrate</button><label class=\"checklabel\"><input type=\"checkbox\" id=\"canListen\"> Listen-only (no ACK, no transmit)</label></div>\n"
   "<div class=\"analyzer-toolbar\" id=\"serialRateRow\" hidden><label for=\"serialRate\">UART baud rate</label><select id=\"serialRate\"><option>1200</option><option>2400</option><option>4800</option><option>9600</option><option>19200</option><option>38400</option><option>57600</option><option selected>115200</option><option>230400</option><option>460800</option><option>921600</option></select><button type=\"button\" id=\"applySerialRate\">Apply UART baud</button></div>\n"
   "<div class=\"analyzer-toolbar\" id=\"uartModeRow\" hidden><label for=\"uartMode\">UART2 mode</label><select id=\"uartMode\"><option value=\"modbus\">Modbus RTU slave</option><option value=\"monitor\">Passive Modbus Monitor</option><option value=\"raw\">Raw UART text</option></select><button type=\"button\" id=\"applyUartMode\">Apply UART mode</button></div><div class=\"analyzer-toolbar\" id=\"canTxRow\"><label class=\"checklabel\"><input type=\"checkbox\" id=\"canTxArm\"> Enable CAN transmission (bench only)</label><div class=\"can-tx-grid\"><div><label for=\"canTxId\">CAN ID (hex)</label><input id=\"canTxId\" maxlength=\"8\" value=\"123\" placeholder=\"123\"></div><div><label for=\"canTxType\">Frame type</label><select id=\"canTxType\"><option value=\"std\">Standard (11-bit)</option><option value=\"ext\">Extended (29-bit)</option></select></div><div><label for=\"canTxData\">Payload hex (0–8 bytes)</label><input id=\"canTxData\" maxlength=\"23\" value=\"11 22 33 44\" placeholder=\"11 22 33 44\"></div><div style=\"display:flex;align-items:end\"><button type=\"button\" id=\"sendCanTx\" style=\"width:100%\">Transmit CAN</button></div></div></div><div class=\"analyzer-toolbar\" id=\"serialTxRow\" hidden><label for=\"serialTx\">Transmit text</label><input id=\"serialTx\" type=\"text\" maxlength=\"240\" placeholder=\"Enter UART command\" style=\"flex:1;min-width:180px\"><label class=\"checklabel\"><input type=\"checkbox\" id=\"serialTxNewline\" checked> Append CR/LF</label><button type=\"button\" id=\"sendSerialTx\">Transmit</button></div>\n"
   "<div class=\"console\" id=\"anConsole\" role=\"log\" aria-live=\"off\">Waiting for analyzer events…</div><p class=\"muted\" id=\"anInfo\">CAN transmission is enabled for controlled bench testing only. Verify the CAN ID, payload, bitrate, transceiver, and bus before transmitting. Modbus RTU uses the selected UART baud, 8N1, and slave ID 1.</p>\n"
@@ -760,13 +867,13 @@ const char INDEX_HTML[] PROGMEM =
   "let savedTheme='dark';try{savedTheme=localStorage.getItem('repairCenterTheme')||'dark';}catch(e){}setTheme(savedTheme==='light'?'light':'dark');themeToggle.addEventListener('click',()=>setTheme(root.dataset.theme==='dark'?'light':'dark'));\n"
   "const buttons=[...document.querySelectorAll('[data-name]')];let states={};let refreshTimer=null,lastSequenceActive=false,lastStaConnected=null,lastReadyRelayOn=null,lastPhysicalResetPressCount=null,lastPhysicalResetButtonPressed=null,statusErrorCount=0,serialRateInitialized=false,uartModeInitialized=false,activeUartMode='modbus';\n"
   "function setConnectionState(online){const el=document.getElementById('connectionLine');el.classList.toggle('live',online);el.classList.toggle('offline',!online);el.classList.remove('connecting');document.getElementById('connectionState').textContent=online?'Live · updated '+new Date().toLocaleTimeString():'Connection lost · retrying';}\n"
-  "function applyManualLocks(){const lockedNames=['Up','Down','Speed 0','Speed 1','Speed 2'];buttons.forEach(b=>{const locked=lastSequenceActive&&lockedNames.includes(b.dataset.name);b.disabled=locked;b.setAttribute('aria-disabled',String(locked));});document.getElementById('manualLockNotice').hidden=!lastSequenceActive;}\n"  "function updateDiagnostics(s){const set=(id,value)=>{const el=document.getElementById(id);if(el)el.textContent=value;};const good=(id,ok)=>{const el=document.getElementById(id);if(el)el.style.color=ok?'var(--good, #36c878)':'var(--bad, #f87171)';};set('diagControl',s.controlTaskHealthy?'Running':'Heartbeat stale');good('diagControl',!!s.controlTaskHealthy);set('diagControlDetail','Last heartbeat '+(s.controlHeartbeatAgeMs??'—')+' ms ago');set('diagReset',s.resetButtonPressed?'Pressed / LOW':'Released / HIGH');good('diagReset',!s.resetButtonPressed);set('diagResetDetail','GPIO47 · '+Number(s.physicalResetPressCount||0)+' debounced press(es)');set('diagHeap',(Number(s.minFreeHeap||0)/1024).toFixed(1)+' KB');set('diagHeapDetail','Current '+(Number(s.freeHeap||0)/1024).toFixed(1)+' KB free');set('diagWifi',s.apActive?'Active':'Not active');good('diagWifi',!!s.apActive);set('diagWifiDetail',(s.apClients||0)+' connected client(s) · '+(s.apIp||'no IP'));set('diagSta',s.staConnected?'Connected':'Disconnected');good('diagSta',!!s.staConnected);set('diagStaDetail',s.staConnected?(s.staIp||'Connected'):'Optional router connection');const cs=s.canBusState===1?'Running':s.canBusState===2?'BUS-OFF':s.canBusState===3?'Recovering':(s.canDriverReady?'Unknown':'Stopped / unavailable');set('diagCan',cs);good('diagCan',s.canDriverReady&&s.canBusState===1);set('diagCanDetail',(s.canErrors||0)+' error(s) · '+(s.canRx||0)+' RX frames');set('diagBuffer',(s.analyzerCount||0)+' / '+(s.analyzerCapacity||80));good('diagBuffer',(s.analyzerCount||0)<(s.analyzerCapacity||80));set('diagBufferDetail','Ring buffer occupancy');set('diagStack',s.controlStackHighWaterWords==null?'Unavailable':s.controlStackHighWaterWords+' words');set('diagLoss',(s.analyzerDropped||0)+' analyzer');set('diagLossDetail',(s.uartDropped||0)+' UART byte(s) dropped');set('diagUpdated','Updated '+new Date().toLocaleTimeString());}\n"
+  "function applyManualLocks(){const lockedNames=['Brake','Enable','Up','Down','Speed 0','Speed 1','Speed 2'];buttons.forEach(b=>{const locked=lastSequenceActive&&lockedNames.includes(b.dataset.name);b.disabled=locked;b.setAttribute('aria-disabled',String(locked));});document.getElementById('manualLockNotice').hidden=!lastSequenceActive;}\n"  "function updateDiagnostics(s){const set=(id,value)=>{const el=document.getElementById(id);if(el)el.textContent=value;};const good=(id,ok)=>{const el=document.getElementById(id);if(el)el.style.color=ok?'var(--good, #36c878)':'var(--bad, #f87171)';};set('diagControl',s.controlTaskHealthy?'Running':'Heartbeat stale');good('diagControl',!!s.controlTaskHealthy);set('diagControlDetail','Last heartbeat '+(s.controlHeartbeatAgeMs??'—')+' ms ago');set('diagReset',s.resetButtonPressed?'Pressed / LOW':'Released / HIGH');good('diagReset',!s.resetButtonPressed);set('diagResetDetail','GPIO42 · '+Number(s.physicalResetPressCount||0)+' debounced press(es)');set('diagHeap',(Number(s.minFreeHeap||0)/1024).toFixed(1)+' KB');set('diagHeapDetail','Current '+(Number(s.freeHeap||0)/1024).toFixed(1)+' KB free');set('diagWifi',s.apActive?'Active':'Not active');good('diagWifi',!!s.apActive);set('diagWifiDetail',(s.apClients||0)+' connected client(s) · '+(s.apIp||'no IP'));set('diagSta',s.staConnected?'Connected':'Disconnected');good('diagSta',!!s.staConnected);set('diagStaDetail',s.staConnected?(s.staIp||'Connected'):'Optional router connection');const cs=s.canBusState===1?'Running':s.canBusState===2?'BUS-OFF':s.canBusState===3?'Recovering':(s.canDriverReady?'Unknown':'Stopped / unavailable');set('diagCan',cs);good('diagCan',s.canDriverReady&&s.canBusState===1);set('diagCanDetail',(s.canErrors||0)+' error(s) · '+(s.canRx||0)+' RX frames');set('diagBuffer',(s.analyzerCount||0)+' / '+(s.analyzerCapacity||80));good('diagBuffer',(s.analyzerCount||0)<(s.analyzerCapacity||80));set('diagBufferDetail','Ring buffer occupancy');set('diagStack',s.controlStackHighWaterWords==null?'Unavailable':('ctl '+s.controlStackHighWaterWords+' / comms '+(s.commsStackHighWaterWords??'—')+' / led '+(s.ledStackHighWaterWords??'—')+' words'));set('diagLoss',(s.analyzerDropped||0)+' analyzer');set('diagLossDetail',(s.uartDropped||0)+' UART overflow event(s)');set('diagUpdated','Updated '+new Date().toLocaleTimeString());}\n"
   "async function refresh(){if(document.visibilityState!=='visible'){clearTimeout(refreshTimer);refreshTimer=setTimeout(refresh,10000);return;}let pollDelay=5000;try{const diagnosticsOpen=document.getElementById('diagnosticsPanel').open;const r=await fetch('/api/status'+(diagnosticsOpen?'':'?compact=1'),{cache:'no-store'});const s=await r.json();const resetCount=Number(s.physicalResetPressCount||0);const resetPressed=!!s.resetButtonPressed;if((lastPhysicalResetPressCount===null&&resetPressed)||(lastPhysicalResetPressCount!==null&&resetCount>lastPhysicalResetPressCount)||(lastPhysicalResetButtonPressed===false&&resetPressed))showToast('Physical reset button pressed');lastPhysicalResetPressCount=resetCount;lastPhysicalResetButtonPressed=resetPressed;if(resetPressed)pollDelay=500;setConnectionState(true);if(!serialRateInitialized){document.getElementById('serialRate').value=String(s.uartBaud);serialRateInitialized=true;}if(!uartModeInitialized){activeUartMode=s.uartMode||'modbus';document.getElementById('uartMode').value=activeUartMode;updateUartModeControls();uartModeInitialized=true;}statusErrorCount=0;if(diagnosticsOpen)updateDiagnostics(s);states=s.outputs||{};lastSequenceActive=!!s.sequenceRunning;applyManualLocks();if(lastStaConnected!==null&&lastStaConnected!==!!s.staConnected)showToast(s.staConnected?'Router Wi-Fi connected':'Router Wi-Fi disconnected',s.staConnected?'':'warn');lastStaConnected=!!s.staConnected;if(lastReadyRelayOn!==null&&lastReadyRelayOn!==!!s.readyRelayOn&&s.readyRelayOn)showToast('Ready signal is ON');lastReadyRelayOn=!!s.readyRelayOn;\n"
   "buttons.forEach(b=>{const on=!!states[b.dataset.name];b.classList.toggle('on',on);b.setAttribute('aria-pressed',String(on));});\n"
-  " const canRateField=document.getElementById('canRate');if(canRateField&&document.activeElement!==canRateField)canRateField.value=String(s.canBitrate||500000);const serialRateField=document.getElementById('serialRate');if(serialRateField&&document.activeElement!==serialRateField)serialRateField.value=String(s.uartBaud||115200);const apSsidField=document.getElementById('apSsid');if(apSsidField&&document.activeElement!==apSsidField)apSsidField.value=s.apSsid||'Repair Center';\n"
+  " const canRateField=document.getElementById('canRate');if(canRateField&&document.activeElement!==canRateField)canRateField.value=String(s.canBitrate||500000);const canListenField=document.getElementById('canListen');if(canListenField&&document.activeElement!==canListenField)canListenField.checked=!!s.canListenOnly;const serialRateField=document.getElementById('serialRate');if(serialRateField&&document.activeElement!==serialRateField)serialRateField.value=String(s.uartBaud||115200);const apSsidField=document.getElementById('apSsid');if(apSsidField&&document.activeElement!==apSsidField)apSsidField.value=s.apSsid||'Repair Center';\n"
   " const wifiPill=document.getElementById('wifiPill');wifiPill.classList.toggle('good',!!s.staConnected);wifiPill.classList.toggle('bad',!s.staConnected);document.getElementById('dashWifi').textContent=s.staConnected?'Connected':'Not connected';document.getElementById('dashRam').textContent=(Number(s.freeHeap||0)/1024).toFixed(1)+' / '+(Number(s.minFreeHeap||0)/1024).toFixed(1)+' KB';const safetyPill=document.getElementById('safetyPill');document.getElementById('dashSafety').textContent=s.safetyState||'UNKNOWN';safetyPill.classList.toggle('good',s.safetyState==='READY');safetyPill.classList.toggle('warn',s.safetyState==='RUNNING');safetyPill.classList.toggle('bad',s.safetyState==='FAULT');document.getElementById('dashIp').textContent=s.apIp||'Unavailable';document.getElementById('dashClients').textContent=`${s.apClients} connected`;document.getElementById('clientPill').classList.toggle('good',Number(s.apClients)>0);document.getElementById('status').textContent=`AP: ${s.apSsid} (${s.apIp})\\nSTA: ${s.staConnected?'connected':'not connected'}${s.staConnected?' — '+s.staIp:''}\\nAP clients: ${s.apClients}\\nFree heap current/minimum: ${(Number(s.freeHeap||0)/1024).toFixed(1)} / ${(Number(s.minFreeHeap||0)/1024).toFixed(1)} KB\\nController state: ${s.safetyState||'UNKNOWN'}\\nCAN bus: ${['Unknown/stopped','Running','BUS-OFF','Recovering'][Number(s.canBusState)||0]}\\nAnalyzer dropped records: ${s.analyzerDropped??'Open diagnostics'}\\nRGB status: ${!s.canDriverReady||s.canBusState===2?'FAULT':(s.sequenceRunning?'SEQUENCE':(s.apClients>0?'CONNECTED':'WAITING'))}\\nCAN RX frames: ${s.canRx??'—'}\\nModbus RX frames: ${s.modbusFrames??'—'}`;\n"
   " document.getElementById('seqStatus').textContent='Sequence: '+(s.sequenceStatus||'Idle')+(s.runModeActive?' — Run Mode active (up/down alternating; configured duration)':'');\n"
-  " const rem=Math.max(0,Number(s.sequenceStepRemainingMs||0)),dur=Math.max(0,Number(s.sequenceStepDurationMs||0)),elapsed=Math.max(0,Number(s.sequenceStepElapsedMs||0));document.getElementById('seqStepName').textContent=s.sequenceRunning?(s.sequenceStatus||'Sequence running'):'Waiting for sequence';document.getElementById('seqStepTime').textContent=s.sequenceRunning?(Math.ceil(rem/1000)+' s remaining'):'—';document.getElementById('seqProgressBar').style.width=s.sequenceRunning&&dur?Math.min(100,elapsed/dur*100)+'%':'0%';document.getElementById('seqDirection').textContent='Direction: '+(String(s.sequenceStatus||'').toLowerCase().includes('down')?'DOWN':(String(s.sequenceStatus||'').toLowerCase().includes('up')?'UP':'—'));document.getElementById('seqStepDetail').textContent=s.sequenceRunning?('Elapsed '+Math.floor(elapsed/1000)+' s of '+Math.ceil(dur/1000)+' s'):'Progress appears while running';\n"
+  " const rem=Math.max(0,Number(s.sequenceStepRemainingMs||0)),dur=Math.max(0,Number(s.sequenceStepDurationMs||0)),elapsed=Math.max(0,Number(s.sequenceStepElapsedMs||0));document.getElementById('seqStepName').textContent=s.sequenceRunning?(s.sequenceStatus||'Sequence running'):'Waiting for sequence';document.getElementById('seqStepTime').textContent=s.sequenceRunning?(Math.ceil(rem/1000)+' s remaining'):'—';document.getElementById('seqProgressBar').style.width=s.sequenceRunning&&dur?Math.min(100,elapsed/dur*100)+'%':'0%';document.getElementById('seqDirection').textContent='Direction: '+(s.sequenceDirection||'—');document.getElementById('seqStepDetail').textContent=s.sequenceRunning?('Elapsed '+Math.floor(elapsed/1000)+' s of '+Math.ceil(dur/1000)+' s'):'Progress appears while running';\n"
   " document.getElementById('autoUp').disabled=!!s.sequenceRunning;document.getElementById('autoDown').disabled=!!s.sequenceRunning;document.getElementById('runMode').disabled=!!s.sequenceRunning;\n"
   "}catch(e){setConnectionState(false);statusErrorCount++;pollDelay=Math.min(20000,5000*(statusErrorCount+1));document.getElementById('status').textContent='Controller not reachable. Reconnect to the Repair Center Wi-Fi, then open http://10.10.10.10/.';}finally{clearTimeout(refreshTimer);refreshTimer=setTimeout(refresh,document.visibilityState!=='visible'?10000:(lastSequenceActive?500:pollDelay));}}\n"
   "buttons.forEach(b=>{b.classList.add('manual-tactile');b.addEventListener('pointerdown',()=>{b.classList.add('pressed');if(navigator.vibrate)navigator.vibrate(18);});['pointerup','pointercancel','pointerleave'].forEach(ev=>b.addEventListener(ev,()=>b.classList.remove('pressed')));b.addEventListener('click',async()=>{b.disabled=true;try{const r=await fetch('/api/output?name='+encodeURIComponent(b.dataset.name)+'&state='+(states[b.dataset.name]?'0':'1'),{method:'POST'});if(!r.ok){const e=await r.json();alert(e.error||'Command rejected');}await refresh();setTimeout(refresh,100);}finally{applyManualLocks();}});});\n"
@@ -818,6 +925,7 @@ const char INDEX_HTML[] PROGMEM =
   "async function applyAnalyzerRate(kind,value){const body=new URLSearchParams({kind,value:String(value)});const r=await fetch('/api/analyzer/config',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body});const j=await r.json();document.getElementById('anInfo').textContent=r.ok?j.message:(j.error||'Could not apply setting.');if(r.ok&&kind==='can')document.getElementById('canRate').value=String(value);if(r.ok&&kind==='serial')document.getElementById('serialRate').value=String(value);}\n"
   "document.getElementById('applyCanRate').addEventListener('click',()=>applyAnalyzerRate('can',document.getElementById('canRate').value).catch(()=>document.getElementById('anInfo').textContent='CAN bitrate update failed.'));\n"
   "document.getElementById('applySerialRate').addEventListener('click',()=>applyAnalyzerRate('serial',document.getElementById('serialRate').value).catch(()=>document.getElementById('anInfo').textContent='UART baud update failed.'));\n"
+  "document.getElementById('canListen').addEventListener('change',e=>applyAnalyzerRate('canmode',e.target.checked?1:0).catch(()=>document.getElementById('anInfo').textContent='CAN mode update failed.').finally(()=>{e.target.blur();refresh();}));\n"
   "function updateUartModeControls(){const raw=activeUartMode==='raw',monitor=activeUartMode==='monitor';document.getElementById('uartMode').value=activeUartMode;document.getElementById('serialTx').disabled=!raw;document.getElementById('sendSerialTx').disabled=!raw;document.getElementById('anInfo').textContent=raw?'Raw UART mode active. Modbus requests are not being processed.':(monitor?'Passive Modbus Monitor active. Frames are captured without replies or transmissions.':'Modbus RTU slave active (ID 1). Switch to Raw UART mode before transmitting text.');}\n"
   "document.getElementById('applyUartMode').addEventListener('click',async()=>{const mode=document.getElementById('uartMode').value;const body=new URLSearchParams({mode});try{const r=await fetch('/api/analyzer/mode',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body});const j=await r.json();if(!r.ok)throw new Error(j.error||'Mode change failed');activeUartMode=mode;updateUartModeControls();}catch(e){document.getElementById('anInfo').textContent=e.message||'UART mode change failed.';}});\n"
   "async function transmitSerial(){const field=document.getElementById('serialTx');let data=field.value;if(document.getElementById('serialTxNewline').checked)data+='\\r\\n';if(!data.trim()){document.getElementById('anInfo').textContent='Enter UART text before transmitting.';return;}const btn=document.getElementById('sendSerialTx');btn.disabled=true;try{const body=new URLSearchParams({data});const r=await fetch('/api/analyzer/tx',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body});const j=await r.json();document.getElementById('anInfo').textContent=r.ok?j.message:(j.error||'UART transmit failed.');if(r.ok){field.value='';await pollAnalyzer();}}catch(e){document.getElementById('anInfo').textContent='UART transmit failed; controller not reachable.';}finally{btn.disabled=activeUartMode!=='raw';}}\n"
@@ -831,6 +939,19 @@ const char INDEX_HTML[] PROGMEM =
   "</script></main></body></html>\n";
 
 // ---------------- HTTP handlers ----------------
+// CSRF guard: browsers always send Origin on cross-site POSTs. Reject any state-changing request
+// whose Origin host differs from the Host header. (There is still no login, by design.)
+bool requireSameOrigin() {
+  const String origin = server.header("Origin");
+  if (origin.isEmpty()) return true; // non-browser clients
+  const String host = server.header("Host");
+  const int p = origin.indexOf("://");
+  const String originHost = p >= 0 ? origin.substring(p + 3) : origin;
+  if (host.length() && originHost.equalsIgnoreCase(host)) return true;
+  server.send(403, "application/json; charset=utf-8", "{\"error\":\"Cross-origin request rejected\"}");
+  return false;
+}
+
 void handleRoot() {
   server.sendHeader("Cache-Control", "no-store");
   server.send_P(200, "text/html; charset=utf-8", INDEX_HTML);
@@ -843,6 +964,7 @@ void handleStatus() {
 }
 
 void handleOutput() {
+  if (!requireSameOrigin()) return;
   if (!server.hasArg("name") || !server.hasArg("state")) {
     server.send(400, "application/json", "{\"error\":\"name and state required\"}");
     return;
@@ -854,10 +976,10 @@ void handleOutput() {
     return;
   }
   const bool requested = stateArg == "1";
-  // During a sequence, manual direction/speed changes are locked; Brake and Enable remain independent.
+  // During an automatic sequence every manual output change is locked (Stop aborts the sequence).
   // Check this before changing any output so rejected commands have no side effects.
-  if (sequenceRunning && index >= 2) {
-    server.send(409, "application/json; charset=utf-8", "{\"error\":\"Direction and speed controls are locked during an automatic sequence\"}");
+  if (sequenceRunning) {
+    server.send(409, "application/json; charset=utf-8", "{\"error\":\"Outputs are locked during an automatic sequence; press Stop to abort\"}");
     return;
   }
   // Update selector groups under one lock so observers never see conflicting states.
@@ -878,6 +1000,7 @@ void handleOutput() {
 }
 
 void handleSequence() {
+  if (!requireSameOrigin()) return;
   if (!server.hasArg("cmd")) {
     server.send(400, "application/json; charset=utf-8", "{\"error\":\"cmd required: up, down, run, stop\"}");
     return;
@@ -917,6 +1040,7 @@ void sendTimerJson() {
 void handleTimersGet() { sendTimerJson(); }
 
 void handleTimersSave() {
+  if (!requireSameOrigin()) return;
   uint32_t parsed[TIMER_COUNT];
   for (size_t i = 0; i < TIMER_COUNT; ++i) {
     if (!server.hasArg(TIMER_KEYS[i])) {
@@ -934,18 +1058,17 @@ void handleTimersSave() {
   if (!timerMutex || xSemaphoreTake(timerMutex, pdMS_TO_TICKS(50)) != pdTRUE) { server.send(503, "application/json; charset=utf-8", "{\"error\":\"Timer settings busy\"}"); return; }
   for (size_t i = 0; i < TIMER_COUNT; ++i) sequenceTimersMs[i] = parsed[i];
   xSemaphoreGive(timerMutex);
-  prefs.begin("seq-timers", false);
-  for (size_t i = 0; i < TIMER_COUNT; ++i) {
-    prefs.putUInt(TIMER_KEYS[i], i == T_RUN_MODE ? parsed[i] / 3600000UL : parsed[i] / 1000UL);
-  }
-  prefs.end();
+  for (size_t i = 0; i < TIMER_COUNT; ++i) markTimerDirty(i);
+  flushDirtyTimers();
   server.send(200, "application/json; charset=utf-8", "{\"ok\":true}");
 }
 
 // Forward declaration: analyzer configuration can restart the CAN driver before its definition below.
 bool startCan();
+bool reconfigureCan(uint32_t rate, bool listen);
 
 void handleAnalyzerConfig() {
+  if (!requireSameOrigin()) return;
   if (!server.hasArg("kind") || !server.hasArg("value")) {
     server.send(400, "application/json; charset=utf-8", "{\"error\":\"kind and value required\"}"); return;
   }
@@ -959,7 +1082,7 @@ void handleAnalyzerConfig() {
     uartBaud = value;
     ExternalSerial.updateBaudRate(uartBaud);
     xSemaphoreGive(uartMutex);
-    prefs.begin("analyzer", false); prefs.putUInt("uartBaud", uartBaud); prefs.end();
+    prefsPutUInt("analyzer", "uartBaud", uartBaud);
     addAnalyzerEvent("serial", "UART baud changed from web analyzer");
     server.send(200, "application/json; charset=utf-8", "{\"ok\":true,\"message\":\"UART baud updated. The inverter port must use the same baud rate.\"}"); return;
   }
@@ -968,20 +1091,25 @@ void handleAnalyzerConfig() {
       server.send(400, "application/json", "{\"error\":\"Unsupported CAN bitrate\"}"); return;
     }
     if (sequenceRunning) { server.send(409, "application/json", "{\"error\":\"Stop the automatic sequence before changing CAN bitrate\"}"); return; }
-    twai_stop(); twai_driver_uninstall();
-    canBitrate = value;
-    const bool ok = startCan();
-    canDriverReady = ok;
-    if (!ok) { server.send(500, "application/json", "{\"error\":\"CAN driver restart failed\"}"); return; }
-    prefs.begin("analyzer", false); prefs.putUInt("canRate", canBitrate); prefs.end();
+    if (!reconfigureCan(value, canListenOnly)) { server.send(500, "application/json", "{\"error\":\"CAN driver restart failed; previous settings restored if possible\"}"); return; }
+    prefsPutUInt("analyzer", "canRate", canBitrate);
     addAnalyzerEvent("can", "CAN bitrate changed from web analyzer");
     String msg = "CAN bitrate updated to " + String(canBitrate / 1000) + " kbit/s. Configure all bus nodes to the same rate.";
     server.send(200, "application/json; charset=utf-8", "{\"ok\":true,\"message\":\"" + msg + "\"}"); return;
   }
-  server.send(400, "application/json", "{\"error\":\"kind must be can or serial\"}");
+  if (kind == "canmode") {
+    if (value > 1) { server.send(400, "application/json", "{\"error\":\"canmode value must be 0 (normal) or 1 (listen-only)\"}"); return; }
+    if (!reconfigureCan(canBitrate, value == 1)) { server.send(500, "application/json", "{\"error\":\"CAN driver restart failed; previous settings restored if possible\"}"); return; }
+    prefsPutUInt("analyzer", "canListen", value);
+    addAnalyzerEvent("can", value ? "CAN listen-only mode enabled" : "CAN normal mode enabled");
+    server.send(200, "application/json; charset=utf-8", value ? "{\"ok\":true,\"message\":\"CAN listen-only: the ESP32 will not ACK or transmit.\"}" : "{\"ok\":true,\"message\":\"CAN normal mode: the ESP32 ACKs frames and may transmit.\"}");
+    return;
+  }
+  server.send(400, "application/json", "{\"error\":\"kind must be can, canmode or serial\"}");
 }
 
 void handleAnalyzerMode() {
+  if (!requireSameOrigin()) return;
   if (!server.hasArg("mode")) { server.send(400, "application/json; charset=utf-8", "{\"error\":\"mode must be modbus, monitor or raw\"}"); return; }
   const String mode = server.arg("mode");
   if (mode != "modbus" && mode != "monitor" && mode != "raw") { server.send(400, "application/json; charset=utf-8", "{\"error\":\"mode must be modbus, monitor or raw\"}"); return; }
@@ -998,6 +1126,7 @@ void handleAnalyzerMode() {
 }
 
 void handleAnalyzerTx() {
+  if (!requireSameOrigin()) return;
   if (!server.hasArg("data")) { server.send(400, "application/json; charset=utf-8", "{\"error\":\"data field required\"}"); return; }
   String data = server.arg("data");
   if (data.isEmpty() || data.length() > 242) { server.send(400, "application/json; charset=utf-8", "{\"error\":\"Transmit text must be 1–242 bytes including line ending\"}"); return; }
@@ -1027,6 +1156,7 @@ void handleAnalyzerTx() {
 }
 
 void handleAnalyzerCanTx() {
+  if (!requireSameOrigin()) return;
   // Require explicit browser-side arm state as well as conservative rate limiting.
   if (!server.hasArg("armed") || server.arg("armed") != "1") { server.send(403, "application/json; charset=utf-8", "{\"error\":\"Enable CAN transmission in the analyzer before sending\"}"); return; }
   // This is a bench tool, not a high-rate CAN generator.
@@ -1059,7 +1189,12 @@ void handleAnalyzerCanTx() {
     msg.data[msg.data_length_code++] = (uint8_t)((hi<<4)|lo); pos += 2;
     if (pos < payload.length() && payload[pos] != ' ' && payload[pos] != ',' && payload[pos] != '\t') { server.send(400,"application/json; charset=utf-8","{\"error\":\"Separate payload bytes with spaces or commas\"}");return; }
   }
-  esp_err_t err = twai_transmit(&msg, 0);
+  if (canListenOnly) { server.send(409, "application/json; charset=utf-8", "{\"error\":\"CAN is in listen-only mode; disable it to transmit\"}"); return; }
+  esp_err_t err = ESP_ERR_INVALID_STATE;
+  if (canMutex && xSemaphoreTake(canMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+    err = twai_transmit(&msg, 0);
+    xSemaphoreGive(canMutex);
+  }
   if (err != ESP_OK) { server.send(503, "application/json; charset=utf-8", "{\"error\":\"TWAI could not queue the frame; check bus state and TX load\"}"); return; }
   lastCanTransmitMs = now;
   char logText[96]; int used=snprintf(logText,sizeof(logText),"TX %s ID=0x%lX DLC=%u DATA=",ext?"EXT":"STD",(unsigned long)id,msg.data_length_code);
@@ -1076,25 +1211,48 @@ void handleAnalyzer() {
   }
   const uint32_t since = server.hasArg("since") ? (uint32_t)server.arg("since").toInt() : 0;
   const char *canStateText = !canDriverReady ? "STOPPED" : (canBusState == 2 ? "BUS-OFF" : (canBusState == 3 ? "RECOVERING" : (canBusState == 1 ? "RUNNING" : "UNKNOWN")));
-  String json = "{\"canRx\":" + String(canRxCount) + ",\"uartRx\":" + String(uartRxCount) + ",\"modbusFrames\":" + String(modbusRxCount) + ",\"modbusErrors\":" + String(modbusErrorCount) + ",\"canErrors\":" + String(canErrorCount) + ",\"droppedLogs\":" + String(analyzerDroppedLogs) + ",\"canLastRxMs\":" + String(canLastRxMs) + ",\"uartLastRxMs\":" + String(uartLastRxMs) + ",\"uptimeMs\":" + String(millis()) + ",\"canStateText\":\"" + String(canStateText) + "\",\"events\":[";
-  bool first = true;
-  if (analyzerMutex && xSemaphoreTake(analyzerMutex, pdMS_TO_TICKS(30)) == pdTRUE) {
-    const size_t start = (analyzerWriteIndex + ANALYZER_LOG_CAPACITY - analyzerCount) % ANALYZER_LOG_CAPACITY;
-    for (size_t n = 0; n < analyzerCount; ++n) {
-      const AnalyzerEvent &e = analyzerLog[(start + n) % ANALYZER_LOG_CAPACITY];
-      if (e.id <= since || source != e.source) continue;
-      if (!first) json += ',';
-      first = false;
-      json += "{\"id\":" + String(e.id) + ",\"ms\":" + String(e.ms) + ",\"source\":\"" + String(e.source) + "\",\"text\":\"" + jsonEscape(String(e.text)) + "\"}";
-    }
-    xSemaphoreGive(analyzerMutex);
-  }
-  json += "]}";
+  String head;
+  head.reserve(480);
+  head = "{\"canRx\":" + String(canRxCount) + ",\"uartRx\":" + String(uartRxCount) + ",\"modbusFrames\":" + String(modbusRxCount) + ",\"modbusErrors\":" + String(modbusErrorCount) + ",\"canErrors\":" + String(canErrorCount) + ",\"droppedLogs\":" + String(analyzerDroppedLogs) + ",\"canLastRxMs\":" + String(canLastRxMs) + ",\"uartLastRxMs\":" + String(uartLastRxMs) + ",\"uptimeMs\":" + String(millis()) + ",\"canStateText\":\"" + String(canStateText) + "\",\"events\":[";
+  // Stream the events one by one (chunked) instead of building one large String.
   server.sendHeader("Cache-Control", "no-store");
-  server.send(200, "application/json; charset=utf-8", json);
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "application/json; charset=utf-8", "");
+  server.sendContent(head);
+  bool first = true;
+  uint32_t nextId = since + 1;
+  for (;;) {
+    AnalyzerEvent e;
+    bool have = false, done = false;
+    // Lock only long enough to copy one record; never hold the mutex during network I/O.
+    if (analyzerMutex && xSemaphoreTake(analyzerMutex, pdMS_TO_TICKS(30)) == pdTRUE) {
+      const uint32_t newest = analyzerNextId;                    // next id to be assigned
+      const uint32_t oldest = newest - (uint32_t)analyzerCount;  // oldest id still stored
+      if (nextId < oldest) nextId = oldest;
+      if (nextId >= newest) done = true;
+      else {
+        e = analyzerLog[(analyzerWriteIndex + ANALYZER_LOG_CAPACITY - (newest - nextId)) % ANALYZER_LOG_CAPACITY];
+        have = true;
+        ++nextId;
+      }
+      xSemaphoreGive(analyzerMutex);
+    } else done = true;
+    if (done) break;
+    if (!have || strcmp(e.source, source.c_str()) != 0) continue;
+    char esc[640];
+    jsonEscapeTo(esc, sizeof(esc), e.text);
+    char line[760];
+    snprintf(line, sizeof(line), "%s{\"id\":%lu,\"ms\":%lu,\"source\":\"%s\",\"text\":\"%s\"}",
+             first ? "" : ",", (unsigned long)e.id, (unsigned long)e.ms, e.source, esc);
+    first = false;
+    server.sendContent(line);
+  }
+  server.sendContent("]}");
+  server.sendContent("");
 }
 
 void handleApWifiSave() {
+  if (!requireSameOrigin()) return;
   if (!server.hasArg("apSsid") || !server.hasArg("apPassword")) {
     server.send(400, "text/plain; charset=utf-8", "Access point name and password are required.");
     return;
@@ -1111,10 +1269,7 @@ void handleApWifiSave() {
     return;
   }
 
-  prefs.begin(PREF_NAMESPACE, false);
-  prefs.putString("apSsid", newSSID);
-  prefs.putString("apPass", newPassword);
-  prefs.end();
+  prefsPutTwoStrings(PREF_NAMESPACE, "apSsid", newSSID, "apPass", newPassword);
   apSSID = newSSID;
   apPassword = newPassword;
 
@@ -1131,6 +1286,7 @@ void handleApWifiSave() {
 }
 
 void handleWifiSave() {
+  if (!requireSameOrigin()) return;
   if (!server.hasArg("ssid") || !server.hasArg("password")) {
     server.send(400, "text/plain; charset=utf-8", "SSID and password fields are required.");
     return;
@@ -1142,10 +1298,7 @@ void handleWifiSave() {
     server.send(400, "text/plain; charset=utf-8", "SSID or password is too long.");
     return;
   }
-  prefs.begin(PREF_NAMESPACE, false);
-  prefs.putString("ssid", staSSID);
-  prefs.putString("password", staPassword);
-  prefs.end();
+  prefsPutTwoStrings(PREF_NAMESPACE, "ssid", staSSID, "password", staPassword);
 
   // Respond before reconnecting, so the browser receives confirmation.
   server.send(200, "text/html; charset=utf-8",
@@ -1164,6 +1317,7 @@ void controlTask(void *parameter) {
                          SPEED2_HOLD, SPEED1_B, SPEED0_B, DIRECTION_OFF_WAIT, ENABLE_OFF_WAIT,
                          RUNMODE_BRAKE_OFF_WAIT };
   Stage stage = IDLE;
+  esp_task_wdt_add(NULL); // subscribe this task to the task watchdog (reset every pass)
   uint32_t deadline = 0;
   int directionIndex = 2;
   bool buttonLastReading = HIGH;
@@ -1175,7 +1329,7 @@ void controlTask(void *parameter) {
   bool physicalResetRequestPending = false;
   uint8_t clientConnectBeepPulses = 0;
   bool clientConnectBeepActive = false;
-  uint32_t clientConnectBeepNextMs = 0;
+  uint32_t clientConnectBeepNextMs = millis();
   auto allSpeedsOff = []() { applyOutputChanges((1UL << 4) | (1UL << 5) | (1UL << 6), 0); };
   auto setOnlySpeed = [](int index) { applyOutputChanges((1UL << 4) | (1UL << 5) | (1UL << 6), 1UL << index); };
   auto beginStage = [&](Stage next, uint32_t durationMs, const char *label) {
@@ -1183,12 +1337,14 @@ void controlTask(void *parameter) {
   };
   auto beginCycle = [&](int direction) {
     directionIndex = direction;
+    sequenceDirection = direction == 2 ? 1 : 2;
     applyOutputChanges((1UL << OUTPUT_COUNT) - 1UL, 1UL << 0); // Disable, clear direction/speeds, and engage brake atomically
     beginStage(BRAKE_WAIT, getSequenceTimerMs(T_BRAKE), directionIndex == 2 ? "Auto UP: Brake hold" : "Auto DOWN: Brake hold");
     setSequenceRunning(true);
   };
   for (;;) {
     controlHeartbeatMs = millis();
+    esp_task_wdt_reset();
     const uint32_t now = millis();
 
     // Drain AP station-connect events into the control task's two-beep queue.
@@ -1258,6 +1414,9 @@ void controlTask(void *parameter) {
       }
     }
 
+    // Keep the beep timestamp fresh while idle so the signed-difference compare below
+    // can never go stale across the 24.8-day millis() sign boundary.
+    if (!clientConnectBeepActive && clientConnectBeepPulses == 0) clientConnectBeepNextMs = now;
     // Client-join beeps take priority after any run-mode pulse already in progress.
     if (clientConnectBeepActive) {
       if ((int32_t)(now - buzzerPulseEndMs) >= 0) {
@@ -1307,12 +1466,9 @@ void controlTask(void *parameter) {
       beginCycle(request == 2 ? 3 : 2);
       if (runModeActive) setSequenceStatus(String("Run Mode: Auto UP (") + String(getSequenceTimerMs(T_RUN_MODE) / 3600000UL) + " hour(s))");
     }
-    if (runModeActive && (int32_t)(now - runModeEndMs) >= 0) {
-      stage = IDLE; setSequenceRunning(false); runModeActive = false; clearSequenceStep();
-      applyOutputChanges((1UL << OUTPUT_COUNT) - 1UL, 0);
-      setSequenceStatus("Run Mode complete — outputs OFF");
-      buzzerAfterRunMode = true; buzzerNextPulseMs = now;
-    }
+    // Run Mode expiry is handled at the end of the current cycle (ENABLE_OFF_WAIT and
+    // RUNMODE_BRAKE_OFF_WAIT), so outputs are never cut mid-ramp. Stop / physical reset
+    // still halt everything immediately.
     if (stage != IDLE && (int32_t)(now - deadline) >= 0) {
       switch (stage) {
         case BRAKE_WAIT:
@@ -1361,7 +1517,7 @@ void controlTask(void *parameter) {
         case IDLE: break;
       }
     }
-    bool local[OUTPUT_COUNT];
+    bool local[OUTPUT_COUNT] = {};
     copyOutputStates(local);
     for (size_t i = 0; i < OUTPUT_COUNT; ++i) digitalWrite(OUTPUTS[i].pin, local[i] ? HIGH : LOW);
     vTaskDelay(pdMS_TO_TICKS(10));
@@ -1373,83 +1529,108 @@ void communicationTask(void *parameter) {
   size_t modbusLength = 0;
   size_t modbusExpectedLength = 0;
   uint32_t seenUartModeGeneration = uartModeGeneration;
-  bool canRecoveryPending = false;
   uint32_t lastCanRecoveryAttemptMs = 0;
+  uint32_t lastUartRxUs = 0;
   twai_message_t message;
   for (;;) {
-    // Batch UART bytes into bounded log records; one event per chunk avoids
-    // flooding the ring buffer at high baud rates.
+    // Raw-mode hex log: bytes are batched 24 per record so a burst cannot flood the ring
+    // buffer. The read loop itself is NOT limited by the batch size.
     char uartBatch[80];
+    uartBatch[0] = 0;
     size_t uartBatchLen = 0;
-    // UART2 is dedicated to Modbus RTU; bytes are framed and checked before requests are handled.
+    size_t uartBatchBytes = 0;
+    bool rawMode = false;
     if (uartMutex && xSemaphoreTake(uartMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
       if (seenUartModeGeneration != uartModeGeneration) {
         modbusLength = modbusExpectedLength = 0;
         seenUartModeGeneration = uartModeGeneration;
       }
-      while (ExternalSerial.available() && uartBatchLen < 48) {
+      rawMode = !modbusModeEnabled && !passiveMonitorEnabled;
+      // RX buffer nearly full means bytes are about to be lost (counted as an overflow event).
+      if (ExternalSerial.available() >= (int)UART_RX_BUFFER_SIZE - 16) ++uartDroppedBytes;
+      // Resynchronise the Modbus framers after an idle gap (>= 3.5 characters, never below 5 ms
+      // because this task polls every millisecond or so).
+      const uint32_t charUs = (11000000UL + uartBaud - 1UL) / uartBaud;
+      uint32_t gapUs = (charUs * 7UL) / 2UL;
+      if (gapUs < 5000UL) gapUs = 5000UL;
+      if (modbusLength && (uint32_t)(micros() - lastUartRxUs) > gapUs) {
+        modbusLength = modbusExpectedLength = 0;
+        ++modbusErrorCount; // incomplete / garbled frame discarded
+      }
+      size_t bytesThisPass = 0;
+      while (ExternalSerial.available() && bytesThisPass < 256) {
         const int value = ExternalSerial.read();
         if (value < 0) break;
+        ++bytesThisPass;
         ++uartRxCount;
         uartLastRxMs = millis();
+        lastUartRxUs = micros();
         if (modbusModeEnabled) modbusProcessByte((uint8_t)value, modbusBuffer, modbusLength, modbusExpectedLength);
         else if (passiveMonitorEnabled) passiveModbusProcessByte((uint8_t)value, modbusBuffer, modbusLength, modbusExpectedLength);
-        const size_t room = sizeof(uartBatch) - uartBatchLen;
-        if (room > 5) {
-          const int wrote = snprintf(uartBatch + uartBatchLen, room, "%s%02X", uartBatchLen ? " " : "", (unsigned)(uint8_t)value);
+        else {
+          const int wrote = snprintf(uartBatch + uartBatchLen, sizeof(uartBatch) - uartBatchLen, "%s%02X", uartBatchLen ? " " : "", (unsigned)(uint8_t)value);
           if (wrote > 0) uartBatchLen += (size_t)wrote;
+          if (++uartBatchBytes >= 24) {
+            char uartEvent[96];
+            snprintf(uartEvent, sizeof(uartEvent), "RX HEX: %s", uartBatch);
+            addAnalyzerEvent("serial", uartEvent);
+            uartBatchLen = 0; uartBatchBytes = 0; uartBatch[0] = 0;
+          }
         }
       }
       xSemaphoreGive(uartMutex);
     }
-    // Keep raw byte chunks only in raw UART mode; Modbus modes log validated frames instead.
-    if (uartBatchLen && !modbusModeEnabled && !passiveMonitorEnabled) {
+    if (rawMode && uartBatchLen) {
       char uartEvent[96];
       snprintf(uartEvent, sizeof(uartEvent), "RX HEX: %s", uartBatch);
       addAnalyzerEvent("serial", uartEvent);
     }
 
-    // CAN receive endpoint. Application-specific CAN IDs/payloads were not
-    // specified, so received frames are counted but do not change outputs.
-    if (twai_receive(&message, 0) == ESP_OK) {
-      ++canRxCount;
-      canLastRxMs = millis();
-      char frame[96];
-      int used = snprintf(frame, sizeof(frame), "%s ID=0x%08lX DLC=%u DATA=", message.extd ? "EXT" : "STD", (unsigned long)message.identifier, message.data_length_code);
-      for (uint8_t i = 0; i < message.data_length_code && i < 8 && used > 0 && (size_t)used < sizeof(frame); ++i) {
-        used += snprintf(frame + used, sizeof(frame) - (size_t)used, "%s%02X", i ? " " : "", message.data[i]);
-      }
-      addAnalyzerEvent("can", frame);
-    }
-    twai_status_info_t twaiStatus;
-    if (twai_get_status_info(&twaiStatus) == ESP_OK) {
-      canErrorCount = twaiStatus.bus_error_count + twaiStatus.tx_error_counter + twaiStatus.rx_error_counter;
-      canBusState = (twaiStatus.state == TWAI_STATE_RUNNING) ? 1 : ((twaiStatus.state == TWAI_STATE_BUS_OFF) ? 2 : ((twaiStatus.state == TWAI_STATE_RECOVERING) ? 3 : 0));
-      const uint32_t statusNow = millis();
-      if (twaiStatus.state == TWAI_STATE_BUS_OFF && !canRecoveryPending &&
-          (uint32_t)(statusNow - lastCanRecoveryAttemptMs) >= 1000UL) {
-        lastCanRecoveryAttemptMs = statusNow;
-        const esp_err_t recovery = twai_initiate_recovery();
-        if (recovery == ESP_OK) {
-          canRecoveryPending = true;
-          addAnalyzerEvent("can", "Bus-off detected; TWAI recovery started");
-        } else {
-          addAnalyzerEvent("can", "TWAI recovery request failed; will retry");
+    // CAN: drain up to 32 frames per pass. canMutex keeps this away from driver restarts.
+    if (canMutex && xSemaphoreTake(canMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+      for (uint8_t n = 0; n < 32 && twai_receive(&message, 0) == ESP_OK; ++n) {
+        ++canRxCount;
+        canLastRxMs = millis();
+        char frame[96];
+        int used = snprintf(frame, sizeof(frame), "%s ID=0x%08lX DLC=%u DATA=", message.extd ? "EXT" : "STD", (unsigned long)message.identifier, message.data_length_code);
+        for (uint8_t i = 0; i < message.data_length_code && i < 8 && used > 0 && (size_t)used < sizeof(frame); ++i) {
+          used += snprintf(frame + used, sizeof(frame) - (size_t)used, "%s%02X", i ? " " : "", message.data[i]);
         }
-      } else if (twaiStatus.state == TWAI_STATE_STOPPED && canRecoveryPending &&
-                 (uint32_t)(statusNow - lastCanRecoveryAttemptMs) >= 1000UL) {
-        lastCanRecoveryAttemptMs = statusNow;
-        const esp_err_t restart = twai_start();
-        if (restart == ESP_OK) {
-          canRecoveryPending = false;
-          canDriverReady = true;
-          addAnalyzerEvent("can", "TWAI recovered and restarted");
-        } else {
-          addAnalyzerEvent("can", "TWAI restart after recovery failed; will retry");
+        addAnalyzerEvent("can", frame);
+      }
+      twai_status_info_t twaiStatus;
+      if (twai_get_status_info(&twaiStatus) == ESP_OK) {
+        // Cumulative counters only, so the displayed value never goes down.
+        canErrorCount = twaiStatus.bus_error_count + twaiStatus.tx_failed_count +
+                        twaiStatus.rx_missed_count + twaiStatus.rx_overrun_count;
+        canBusState = (twaiStatus.state == TWAI_STATE_RUNNING) ? 1 : ((twaiStatus.state == TWAI_STATE_BUS_OFF) ? 2 : ((twaiStatus.state == TWAI_STATE_RECOVERING) ? 3 : 0));
+        const uint32_t statusNow = millis();
+        if (twaiStatus.state == TWAI_STATE_BUS_OFF && !canRecoveryPending &&
+            (uint32_t)(statusNow - lastCanRecoveryAttemptMs) >= 1000UL) {
+          lastCanRecoveryAttemptMs = statusNow;
+          const esp_err_t recovery = twai_initiate_recovery();
+          if (recovery == ESP_OK) {
+            canRecoveryPending = true;
+            addAnalyzerEvent("can", "Bus-off detected; TWAI recovery started");
+          } else {
+            addAnalyzerEvent("can", "TWAI recovery request failed; will retry");
+          }
+        } else if (twaiStatus.state == TWAI_STATE_STOPPED && canRecoveryPending &&
+                   (uint32_t)(statusNow - lastCanRecoveryAttemptMs) >= 1000UL) {
+          lastCanRecoveryAttemptMs = statusNow;
+          const esp_err_t restart = twai_start();
+          if (restart == ESP_OK) {
+            canRecoveryPending = false;
+            canDriverReady = true;
+            addAnalyzerEvent("can", "TWAI recovered and restarted");
+          } else {
+            addAnalyzerEvent("can", "TWAI restart after recovery failed; will retry");
+          }
         }
       }
+      xSemaphoreGive(canMutex);
     }
-    vTaskDelay(pdMS_TO_TICKS(2));
+    vTaskDelay(pdMS_TO_TICKS(1));
   }
 }
 
@@ -1487,7 +1668,10 @@ void statusLedTask(void *parameter) {
 }
 
 bool startCan() {
-  twai_general_config_t general = TWAI_GENERAL_CONFIG_DEFAULT(PIN_CAN_TX, PIN_CAN_RX, TWAI_MODE_NORMAL);
+  const twai_mode_t mode = canListenOnly ? TWAI_MODE_LISTEN_ONLY : TWAI_MODE_NORMAL;
+  twai_general_config_t general = TWAI_GENERAL_CONFIG_DEFAULT(PIN_CAN_TX, PIN_CAN_RX, mode);
+  general.rx_queue_len = 64; // default of 5 overflows on a busy bus
+  general.tx_queue_len = 8;
   twai_timing_config_t timing;
   if (canBitrate == 125000) timing = TWAI_TIMING_CONFIG_125KBITS();
   else if (canBitrate == 250000) timing = TWAI_TIMING_CONFIG_250KBITS();
@@ -1497,7 +1681,34 @@ bool startCan() {
   esp_err_t err = twai_driver_install(&general, &timing, &filter);
   if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) return false;
   err = twai_start();
-  return err == ESP_OK || err == ESP_ERR_INVALID_STATE;
+  if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) { twai_driver_uninstall(); return false; }
+  return true;
+}
+
+// Restart TWAI with a new bitrate and/or mode. Holds canMutex so the comms task and the
+// transmit handler cannot touch the driver while it is stopped or uninstalled. On failure
+// the previous settings are restored.
+bool reconfigureCan(uint32_t rate, bool listen) {
+  if (!canMutex || xSemaphoreTake(canMutex, pdMS_TO_TICKS(1000)) != pdTRUE) return false;
+  const uint32_t oldRate = canBitrate;
+  const bool oldListen = canListenOnly;
+  canDriverReady = false;
+  canBusState = 0;
+  canRecoveryPending = false;
+  twai_stop();
+  twai_driver_uninstall();
+  canBitrate = rate;
+  canListenOnly = listen;
+  bool ok = startCan();
+  if (!ok) {
+    canBitrate = oldRate;
+    canListenOnly = oldListen;
+    if (startCan()) canDriverReady = true;
+  } else {
+    canDriverReady = true;
+  }
+  xSemaphoreGive(canMutex);
+  return ok;
 }
 
 // Captive-portal detection: redirect HTTP probes to the I.R.A. dashboard.
@@ -1544,7 +1755,9 @@ void setup() {
   timerMutex = xSemaphoreCreateMutex();
   analyzerMutex = xSemaphoreCreateMutex();
   uartMutex = xSemaphoreCreateMutex();
-  if (!stateMutex || !controlStateMutex || !timerMutex || !analyzerMutex || !uartMutex) {
+  prefsMutex = xSemaphoreCreateMutex();
+  canMutex = xSemaphoreCreateMutex();
+  if (!stateMutex || !controlStateMutex || !timerMutex || !analyzerMutex || !uartMutex || !prefsMutex || !canMutex) {
     failSafeHalt("FreeRTOS mutex allocation failed");
   }
 
@@ -1602,29 +1815,52 @@ void setup() {
   // Unknown HTTP paths are redirected to the dashboard, which also helps
   // browsers opened by Android captive-portal notifications.
   server.onNotFound(redirectToPortal);
+  static const char *collectedHeaders[] = {"Origin", "Host"};
+  server.collectHeaders(collectedHeaders, 2); // needed by requireSameOrigin()
   server.begin();
 
   prefs.begin("analyzer", true);
   uartBaud = prefs.getUInt("uartBaud", DEFAULT_UART_BAUD);
   canBitrate = prefs.getUInt("canRate", 500000);
+  canListenOnly = prefs.getUInt("canListen", 0) == 1;
   prefs.end();
   if (uartBaud < 1200 || uartBaud > 921600) uartBaud = DEFAULT_UART_BAUD;
   if (canBitrate != 125000 && canBitrate != 250000 && canBitrate != 500000 && canBitrate != 1000000) canBitrate = 500000;
+  ExternalSerial.setRxBufferSize(UART_RX_BUFFER_SIZE); // must be set before begin()
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+  ExternalSerial.onReceiveError([](hardwareSerial_error_t error) {
+    if (error == UART_BUFFER_FULL_ERROR || error == UART_FIFO_OVF_ERROR) ++uartDroppedBytes;
+  });
+#endif
   ExternalSerial.begin(uartBaud, SERIAL_8N1, PIN_UART_RX, PIN_UART_TX);
   const bool canStarted = startCan();
   canDriverReady = canStarted;
   if (!canStarted) canBusState = 0;
 
+  // Task watchdog: the control task resets it every pass (~10 ms). If that task ever hangs,
+  // the chip reboots after 3 s and setup() drives every output LOW again.
+  // External pull-downs / interlocks are still required for the reset window.
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+  {
+    esp_task_wdt_config_t wdtConfig = {};
+    wdtConfig.timeout_ms = 3000;
+    wdtConfig.idle_core_mask = 0;
+    wdtConfig.trigger_panic = true;
+    if (esp_task_wdt_reconfigure(&wdtConfig) != ESP_OK) esp_task_wdt_init(&wdtConfig);
+  }
+#else
+  esp_task_wdt_init(3, true);
+#endif
   // Arduino loop and Wi-Fi system work use the framework's normal scheduling.
   // The explicit control, communications and status-LED tasks use FreeRTOS.
-  if (xTaskCreatePinnedToCore(controlTask, "control", 3072, nullptr, 3, &controlTaskHandle, 1) != pdPASS) {
+  if (xTaskCreatePinnedToCore(controlTask, "control", 4096, nullptr, 3, &controlTaskHandle, 1) != pdPASS) {
     failSafeHalt("Control task creation failed");
   }
-  if (xTaskCreatePinnedToCore(communicationTask, "comms", 4096, nullptr, 2, &communicationTaskHandle, 1) != pdPASS) {
+  if (xTaskCreatePinnedToCore(communicationTask, "comms", 8192, nullptr, 2, &communicationTaskHandle, 1) != pdPASS) {
     vTaskDelete(controlTaskHandle); controlTaskHandle = nullptr;
     failSafeHalt("Communications task creation failed");
   }
-  if (xTaskCreatePinnedToCore(statusLedTask, "status-led", 2048, nullptr, 1, &statusLedTaskHandle, 1) != pdPASS) {
+  if (xTaskCreatePinnedToCore(statusLedTask, "status-led", 3072, nullptr, 1, &statusLedTaskHandle, 1) != pdPASS) {
     vTaskDelete(communicationTaskHandle); communicationTaskHandle = nullptr;
     vTaskDelete(controlTaskHandle); controlTaskHandle = nullptr;
     failSafeHalt("Status LED task creation failed");
@@ -1634,6 +1870,7 @@ void setup() {
 void loop() {
   dnsServer.processNextRequest();
   server.handleClient();
+  flushDirtyTimers(); // NVS writes happen here, never in the UART/Modbus path
   const uint32_t now = millis();
   if ((uint32_t)(now - lcdLastRefreshMs) >= LCD_REFRESH_MS) {
     lcdLastRefreshMs = now;
