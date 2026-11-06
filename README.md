@@ -29,26 +29,28 @@ All seven control outputs are active-HIGH in the sketch. Use suitable driver sta
 | Buzzer relay | 12 | Active-HIGH |
 | UART2 RX / TX | 16 / 17 | Connect to transceiver RO / DI respectively |
 | CAN TX / RX | 18 / 21 | Connect to a CAN transceiver, not directly to CANH/CANL |
-| Onboard addressable RGB LED | 48 | Default for the pictured revision; change `IRA_RGB_LED_PIN` to 38 if required by your board revision |
+| Onboard addressable RGB LED | 48 | Pictured revision; some revisions use GPIO38 |
 | LCD RS | 1 | 16x2 character LCD, 4-bit mode |
 | LCD E | 2 | 16x2 character LCD, 4-bit mode |
 | LCD D4 / D5 / D6 / D7 | 15 / 39 / 40 / 41 | LCD data lines; leave D0–D3 unconnected |
-| Physical sequence reset button | 42 | Button to GND, active-LOW; internal pull-up; stops sequences and silences the post-Run-Mode buzzer; does not reboot the ESP32 |
+| Physical sequence reset button | 47 | Normally-open button to GND, active-LOW; sketch internal pull-up; stops sequences and silences the post-Run-Mode buzzer; does not reboot the ESP32 |
 
-Check the RGB LED data pin against your exact board revision. The sketch assumes an addressable one-pixel LED on GPIO48, as on many N16R8 boards; some revisions use GPIO38. The `IRA_RGB_LED_PIN` constant is near the other pin assignments. The sketch sets a low brightness to limit LED current.
+Check the RGB LED data pin against your exact board revision. The pictured board uses GPIO48, and the sketch assumes that assignment. Some revisions use GPIO38. The `IRA_RGB_LED_PIN` constant is near the other pin assignments. The sketch sets a low brightness to limit LED current.
 
 ### LCD wiring and display
 
 The sketch drives the pictured 16-pin parallel character LCD as a 16x2 HD44780-compatible display in 4-bit mode. Connect LCD RS, E, D4, D5, D6, and D7 to the GPIOs in the table. Connect RW to GND, and leave D0–D3 unconnected. Connect LCD VSS to GND, VDD to the supply specified for your exact LCD module, VO to the contrast potentiometer/wiper, and the backlight pins (A/K or BLA/BLK) according to the module markings. The display refreshes about twice per second with the current sequence step and remaining time, or idle/CAN status and AP client count. CAN faults take priority.
 
-Check the LCD's logic-level requirements before connecting it. ESP32 GPIOs are 3.3 V and are not 5 V tolerant; a 5 V LCD module may require level shifting on the six ESP32-to-LCD signal lines. Do not connect a 5 V LCD signal output to an ESP32 pin. The selected LCD pins leave GPIO38 unused for board revisions that use it for the onboard RGB LED.
+Check the LCD's logic-level requirements before connecting it. ESP32 GPIOs are 3.3 V and are not 5 V tolerant; a 5 V LCD module may require level shifting on the six ESP32-to-LCD signal lines. Do not connect a 5 V LCD signal output to an ESP32 pin.
+
+Connect a normally-open reset switch between **GPIO47** and **GND**. The sketch enables its internal pull-up and treats LOW as pressed; an external pull-up is not required. Do not connect GPIO47 to an external 3.3 V or 5 V supply. In the dashboard, open **Diagnostics & controller health** to see the live GPIO47 level and debounced press count.
 
 ## Features
 
 - Wi-Fi access point and optional router connection. The dashboard is served at `http://10.10.10.10/` while connected to the device AP.
 - Manual controls for Brake, Enable, direction, and speed selections. Direction and speed are interlocked during automatic sequences.
 - Auto UP and Auto DOWN timed sequences, plus Run Mode that alternates direction until its configured duration expires.
-- Physical sequence reset button stops an active sequence, returns the sequence controller to idle (READY when CAN is healthy), and silences the post-Run-Mode buzzer. It does not reboot the ESP32.
+- Physical sequence reset button on GPIO47 stops an active sequence, returns the sequence controller to idle (READY when CAN is healthy), and silences the post-Run-Mode buzzer. It does not reboot the ESP32. When the dashboard is open, pressing it also displays a toast notification.
 - Configurable timers stored in ESP32 NVS, including the ready-signal delay and Run Mode duration.
 - Ready button behavior: a debounced press starts the configured delay; the ready relay activates only while the button remains held. A raw release turns the relay off immediately.
 - The buzzer beeps twice for 2 seconds each when an access-point client connects. After Run Mode completes, it gives 2-second pulses at the configured interval until stopped.
