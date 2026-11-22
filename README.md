@@ -4,6 +4,8 @@ I.R.A. (Interactive Relay Automation) is an ESP32-S3 web-controlled relay sequen
 
 The Arduino sketch is [`ESP32-S3-N16R8V.ino`](ESP32-S3-N16R8V.ino). The included board image is [`ESP32-S3-N16R8V.jpg`](ESP32-S3-N16R8V.jpg).
 
+A native Kotlin Android controller app is in [`android-app/`](android-app/README.md). It connects to the ESP32's existing local HTTP API; it does not replace the firmware or browser dashboard.
+
 ## Board setup
 
 The pin assignments target the ESP32-S3 N16R8 board shown in the image. In Arduino IDE, select **ESP32-S3 Dev Module** or the exact board variant if installed. Configure **16 MB flash** and **8 MB OPI PSRAM** using the available board menu options.

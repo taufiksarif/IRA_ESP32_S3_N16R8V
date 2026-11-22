@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" role="img" aria-label="Microchip">
+  <defs>
+    <linearGradient id="g" x1="0" y1="16" x2="16" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#3f1174"/>
+      <stop offset="0.55" stop-color="#ad1f66"/>
+      <stop offset="1" stop-color="#f97d10"/>
+    </linearGradient>
+  </defs>
+  <rect width="16" height="16" rx="3" fill="url(#g)"/>
+  <g fill="#fff7f0">
+    <rect x="4" y="1" width="2" height="2"/>
+    <rect x="7" y="1" width="2" height="2"/>
+    <rect x="10" y="1" width="2" height="2"/>
+    <rect x="4" y="13" width="2" height="2"/>
+    <rect x="7" y="13" width="2" height="2"/>
+    <rect x="10" y="13" width="2" height="2"/>
+    <rect x="1" y="4" width="2" height="2"/>
+    <rect x="1" y="7" width="2" height="2"/>
+    <rect x="1" y="10" width="2" height="2"/>
+    <rect x="13" y="4" width="2" height="2"/>
+    <rect x="13" y="7" width="2" height="2"/>
+    <rect x="13" y="10" width="2" height="2"/>
+  </g>
+  <rect x="3" y="3" width="10" height="10" rx="2" fill="#180a2b"/>
+  <rect x="5" y="5" width="2" height="2" fill="#f97d10"/>
+</svg>
