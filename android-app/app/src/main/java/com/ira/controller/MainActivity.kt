@@ -178,7 +178,6 @@ private fun IraNativeApp(isForeground: Boolean, networkProvider: () -> Network?)
     var timerMessage by remember { mutableStateOf("Connect to the controller to load saved timer settings.") }
     var timerBusy by remember { mutableStateOf(false) }
     var showAnalyzer by rememberSaveable { mutableStateOf(false) }
-    var pendingManualOutput by remember { mutableStateOf<Pair<String, Boolean>?>(null) }
     val api = remember(activeAddress) { ControllerApi(activeAddress, networkProvider) }
     val scope = rememberCoroutineScope()
     val view = LocalView.current
@@ -366,7 +365,7 @@ private fun IraNativeApp(isForeground: Boolean, networkProvider: () -> Network?)
                             if (demoMode) {
                                 val updated = demoStatus.outputs.toMutableMap().apply { put(name, value) }
                                 demoStatus = demoStatus.copy(outputs = updated)
-                            } else pendingManualOutput = name to value
+                            } else applyManualOutput(name, value)
                         },
                         onSequence = { command ->
                             if (demoMode) {
@@ -433,21 +432,6 @@ private fun IraNativeApp(isForeground: Boolean, networkProvider: () -> Network?)
                 exit = slideOutVertically { -it } + fadeOut(),
             ) {
                 ToastCard(visibleToast)
-            }
-
-            pendingManualOutput?.let { (name, state) ->
-                AlertDialog(
-                    onDismissRequest = { pendingManualOutput = null },
-                    title = { Text("Confirm output change") },
-                    text = { Text("Set the $name output ${if (state) "ON" else "OFF"}? This changes a controller output connected to your equipment.") },
-                    confirmButton = {
-                        TextButton(onClick = {
-                            pendingManualOutput = null
-                            applyManualOutput(name, state)
-                        }) { Text("Confirm") }
-                    },
-                    dismissButton = { TextButton(onClick = { pendingManualOutput = null }) { Text("Cancel") } },
-                )
             }
         }
     }
@@ -635,7 +619,7 @@ private fun ControlsCard(
 ) {
     PanelCard {
         Text("Controls", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-        Text("Tap an output to review and confirm the change. Run Mode alternates Auto UP and Auto DOWN for the configured duration.", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
+        Text("Tap an output to toggle it. Run Mode alternates Auto UP and Auto DOWN for the configured duration.", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
         val names = listOf("Brake", "Enable", "Up", "Down", "Speed 0", "Speed 1", "Speed 2")
         names.chunked(2).forEach { rowNames ->
             Row(horizontalArrangement = Arrangement.spacedBy(9.dp), modifier = Modifier.fillMaxWidth()) {
