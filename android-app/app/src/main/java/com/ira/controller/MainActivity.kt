@@ -463,7 +463,11 @@ private fun Header(lightTheme: Boolean, onToggleTheme: () -> Unit) {
         TactileButton(
             text = if (lightTheme) "🌙 Dark" else "☀️ Light",
             style = TactileStyle.TOOL,
-            modifier = Modifier.width(106.dp),
+            modifier = Modifier.width(88.dp),
+            minimumHeight = 38.dp,
+            horizontalPadding = 8.dp,
+            verticalPadding = 6.dp,
+            borderWidth = 0.75.dp,
             onClick = onToggleTheme,
         )
     }
@@ -471,6 +475,7 @@ private fun Header(lightTheme: Boolean, onToggleTheme: () -> Unit) {
 
 @Composable
 private fun SafetyCard(status: ControllerStatus?, offline: Boolean, demoMode: Boolean, onOpenAnalyzer: () -> Unit) {
+    val lightTheme = MaterialTheme.colorScheme.background == Color(0xFFDCEFE1)
     val state = if (demoMode) "DEMO" else status?.safetyState ?: "UNKNOWN"
     val color = when (state) {
         "READY" -> ActiveGreen
@@ -481,8 +486,8 @@ private fun SafetyCard(status: ControllerStatus?, offline: Boolean, demoMode: Bo
     }
     Row(
         Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp))
-            .background(Brush.linearGradient(listOf(PanelGreen, PanelDark)))
-            .border(1.dp, LineGreen, RoundedCornerShape(18.dp)).padding(horizontal = 12.dp, vertical = 8.dp),
+            .background(Brush.linearGradient(if (lightTheme) listOf(Color(0xFFF8FFF9), Color(0xFFE6F5E9)) else listOf(PanelGreen, PanelDark)))
+            .border(1.dp, if (lightTheme) Color(0xFFB6D9C1) else LineGreen, RoundedCornerShape(18.dp)).padding(horizontal = 12.dp, vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) {
@@ -497,12 +502,12 @@ private fun SafetyCard(status: ControllerStatus?, offline: Boolean, demoMode: Bo
             Text(state, color = color, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.ExtraBold)
         }
         TactileButton(
-            text = "Analyzer",
+            text = "⚙ Analyzer",
             style = TactileStyle.SEQUENCE,
-            modifier = Modifier.width(88.dp),
+            modifier = Modifier.width(100.dp),
             cornerRadius = 999.dp,
             minimumHeight = 38.dp,
-            horizontalPadding = 10.dp,
+            horizontalPadding = 8.dp,
             verticalPadding = 7.dp,
             onClick = onOpenAnalyzer,
         )
@@ -594,7 +599,7 @@ private fun ConnectionCard(
             TactileButton(if (error == null) "Connect" else "Retry", TactileStyle.SEQUENCE, modifier = Modifier.width(96.dp), onClick = onReconnect)
         }
         TactileButton(
-            "Open Wi-Fi settings", TactileStyle.TOOL, modifier = Modifier.fillMaxWidth(), cornerRadius = 14.dp,
+            "📶 Open Wi-Fi settings", TactileStyle.TOOL, modifier = Modifier.fillMaxWidth(), cornerRadius = 14.dp,
         ) {
             context.startActivity(Intent(Settings.ACTION_WIFI_SETTINGS))
         }
@@ -736,6 +741,7 @@ internal fun TactileButton(
     minimumHeight: Dp = 46.dp,
     horizontalPadding: Dp = 13.dp,
     verticalPadding: Dp = 11.dp,
+    borderWidth: Dp = 1.dp,
     onClick: () -> Unit,
 ) {
     val interaction = remember { MutableInteractionSource() }
@@ -752,7 +758,7 @@ internal fun TactileButton(
         TactileStyle.SEQUENCE -> Triple(listOf(BlueTop, BlueMid, BlueBottom), Color(0xFF9BDCFF), Color.White)
         TactileStyle.RUN -> Triple(listOf(YellowTop, YellowMid, YellowBottom), Color(0xFFFFF0A0), Color(0xFF342400))
         TactileStyle.STOP -> Triple(listOf(RedTop, RedMid, RedBottom), Color(0xFFFFB0B3), Color.White)
-        TactileStyle.TOOL -> Triple(listOf(PanelGreen, PanelDark), LineGreen, MaterialTheme.colorScheme.onSurface)
+        TactileStyle.TOOL -> if (MaterialTheme.colorScheme.background == Color(0xFFDCEFE1)) Triple(listOf(Color(0xFFF8FFF9), Color(0xFFE6F5E9)), Color(0xFFB6D9C1), Color(0xFF173727)) else Triple(listOf(PanelGreen, PanelDark), LineGreen, TextGreen)
         TactileStyle.NEUTRAL -> Triple(listOf(Color(0xFF40516B), Color(0xFF27364D), Color(0xFF1C293E)), Color(0xFF53667F), Color.White)
     }
     LaunchedEffect(pressed) {
@@ -769,7 +775,7 @@ internal fun TactileButton(
             .shadow(5.dp - 4.dp * pressDepth, shape)
             .clip(shape)
             .background(Brush.verticalGradient(palette.first))
-            .border(1.dp, palette.second, shape)
+            .border(borderWidth, palette.second, shape)
             .padding(horizontal = horizontalPadding, vertical = verticalPadding)
             .clickable(interactionSource = interaction, indication = null, enabled = enabled, onClick = onClick),
         contentAlignment = Alignment.Center,
