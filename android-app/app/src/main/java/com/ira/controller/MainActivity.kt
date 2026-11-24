@@ -218,7 +218,9 @@ private fun IraNativeApp(isForeground: Boolean, networkProvider: () -> Network?)
             busy = true
             try {
                 api.setOutput(name, state)
-                liveStatus = api.readStatus()
+                liveStatus = liveStatus?.let { current ->
+                    current.copy(outputs = current.outputs + (name to state))
+                }
             } catch (exception: Exception) {
                 toast(exception.message ?: "Output command rejected", true)
             } finally { busy = false }
