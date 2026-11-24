@@ -1,16 +1,35 @@
 package com.ira.controller
 
+import android.content.ContentValues
+import android.content.Context
 import android.content.Intent
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
+import android.os.Build
 import android.os.Bundle
+import android.os.Environment
+import android.provider.MediaStore
 import android.provider.Settings
+import android.util.Base64
 import android.view.HapticFeedbackConstants
 import android.view.View
+import android.view.ViewGroup
+import android.widget.FrameLayout
+import android.webkit.JavascriptInterface
+import android.webkit.WebChromeClient
+import android.webkit.WebResourceError
+import android.webkit.WebResourceRequest
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import android.widget.Toast
+import java.net.HttpURLConnection
+import java.net.URL
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
@@ -51,7 +70,6 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
-import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.darkColorScheme
@@ -73,6 +91,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -84,6 +103,7 @@ import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.io.File
 
 private val DeepGreen = Color(0xFF041B13)
 private val PanelGreen = Color(0xFF0D3625)
@@ -106,23 +126,67 @@ private data class QueuedToast(val message: String, val warning: Boolean = false
 
 class MainActivity : ComponentActivity() {
     private val connectivityManager by lazy { getSystemService(ConnectivityManager::class.java) }
-    private var appInForeground by mutableStateOf(false)
-    private var controllerWifiNetwork by mutableStateOf<Network?>(null)
+    @Volatile private var controllerWifiNetwork: Network? = null
     private var wifiNetworkCallback: ConnectivityManager.NetworkCallback? = null
+    private lateinit var appRoot: FrameLayout
+    private lateinit var dashboard: WebView
+    private var controllerAddress = "10.10.10.10"
+    @Volatile private var showingDemo = true
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        setContent {
-            IraNativeApp(
-                isForeground = appInForeground,
-                networkProvider = { controllerWifiNetwork },
+        controllerAddress = getSharedPreferences("ira-app", MODE_PRIVATE)
+            .getString("controller-address", "10.10.10.10") ?: "10.10.10.10"
+        window.statusBarColor = android.graphics.Color.rgb(4, 27, 19)
+        window.navigationBarColor = android.graphics.Color.rgb(4, 27, 19)
+
+        dashboard = WebView(this).apply {
+            setBackgroundColor(android.graphics.Color.rgb(4, 27, 19))
+            settings.javaScriptEnabled = true
+            settings.domStorageEnabled = true
+            settings.loadsImagesAutomatically = true
+            settings.allowFileAccess = false
+            settings.allowContentAccess = false
+            webChromeClient = WebChromeClient()
+            addJavascriptInterface(AnalyzerDownloadBridge(this@MainActivity), "IraAndroid")
+            webViewClient = object : WebViewClient() {
+                override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
+                    return !request.url.toString().startsWith("http://$controllerAddress/") &&
+                        !request.url.toString().startsWith("file:///android_asset/")
+                }
+
+                override fun onPageFinished(view: WebView, url: String) {
+                    installAnalyzerDownloads(view)
+                    installMobileStopButtonLayout(view)
+                }
+
+                override fun onReceivedError(view: WebView, request: WebResourceRequest, error: WebResourceError) {
+                    if (request.isForMainFrame && !showingDemo) showDemoDashboard()
+                }
+            }
+        }
+        appRoot = FrameLayout(this).apply {
+            setBackgroundColor(android.graphics.Color.rgb(4, 27, 19))
+            addView(
+                dashboard,
+                FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.MATCH_PARENT,
+                    FrameLayout.LayoutParams.MATCH_PARENT,
+                ),
             )
         }
+        ViewCompat.setOnApplyWindowInsetsListener(appRoot) { view, insets ->
+            val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
+            view.setPadding(0, bars.top, 0, bars.bottom)
+            insets
+        }
+        setContentView(appRoot)
+        showDemoDashboard()
     }
 
     override fun onStart() {
         super.onStart()
-        appInForeground = true
+        showDemoDashboard()
         val request = NetworkRequest.Builder()
             .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
             .removeCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
@@ -130,14 +194,22 @@ class MainActivity : ComponentActivity() {
         val callback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
                 controllerWifiNetwork = network
+                loadLiveDashboardIfReachable(network)
             }
 
             override fun onLost(network: Network) {
-                if (controllerWifiNetwork == network) controllerWifiNetwork = null
+                runOnUiThread {
+                    if (controllerWifiNetwork == network) {
+                        connectivityManager.bindProcessToNetwork(null)
+                        controllerWifiNetwork = null
+                        showDemoDashboard()
+                    }
+                }
             }
 
             override fun onUnavailable() {
                 controllerWifiNetwork = null
+                runOnUiThread { showDemoDashboard() }
             }
         }
         try {
@@ -149,24 +221,79 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onStop() {
-        appInForeground = false
         wifiNetworkCallback?.let { callback ->
             runCatching { connectivityManager.unregisterNetworkCallback(callback) }
         }
         wifiNetworkCallback = null
+        connectivityManager.bindProcessToNetwork(null)
         controllerWifiNetwork = null
         super.onStop()
     }
+
+    private fun loadLiveDashboardIfReachable(network: Network) {
+        Thread {
+            val reachable = runCatching {
+                (network.openConnection(URL("http://$controllerAddress/api/status")) as HttpURLConnection).run {
+                    connectTimeout = 2500
+                    readTimeout = 2500
+                    try { responseCode == 200 } finally { disconnect() }
+                }
+            }.getOrDefault(false)
+            runOnUiThread {
+                if (controllerWifiNetwork == network) {
+                    if (reachable) {
+                        connectivityManager.bindProcessToNetwork(network)
+                        if (showingDemo) {
+                            showingDemo = false
+                            dashboard.tag = "${controllerAddress.trim().trimEnd('/')}|live"
+                            dashboard.loadUrl("http://$controllerAddress/")
+                        }
+                    } else showDemoDashboard()
+                }
+            }
+        }.start()
+    }
+
+    private fun showDemoDashboard() {
+        if (!::dashboard.isInitialized) return
+        showingDemo = true
+        val normalizedAddress = controllerAddress.trim().trimEnd('/').ifBlank { "10.10.10.10" }
+        val renderKey = "$normalizedAddress|demo"
+        if (dashboard.tag == renderKey) return
+        dashboard.tag = renderKey
+        dashboard.post {
+            if (!showingDemo || dashboard.tag != renderKey) return@post
+            dashboard.loadDataWithBaseURL(
+                "http://$normalizedAddress/",
+                createDemoPageHtml(),
+                "text/html",
+                "UTF-8",
+                null,
+            )
+        }
+    }
+
+    private fun createDemoPageHtml(): String = runCatching {
+            val html = assets.open("index.html").bufferedReader(Charsets.UTF_8).use { it.readText() }
+            val mock = assets.open("demo-mode.js").bufferedReader(Charsets.UTF_8).use { it.readText() }
+            val charsetTag = "<meta charset=\"utf-8\">"
+            check(html.contains(charsetTag)) { "Dashboard HTML is missing its UTF-8 declaration" }
+            html.replace(charsetTag, "$charsetTag<script>$mock</script>")
+        }.getOrElse { error ->
+            "<!doctype html><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><body style=\"margin:0;padding:24px;background:#041b13;color:#eafff1;font:16px system-ui\"><h1>IRA demo unavailable</h1><p>${error.message ?: "Could not load the packaged dashboard."}</p></body>"
+        }
 }
 
 @Composable
-private fun IraNativeApp(isForeground: Boolean, networkProvider: () -> Network?) {
+private fun IraNativeApp(
+    isForeground: Boolean,
+    networkProvider: () -> Network?,
+) {
     val context = LocalContext.current
     val preferences = remember { context.getSharedPreferences("ira-app", 0) }
     var address by rememberSaveable { mutableStateOf(preferences.getString("controller-address", "10.10.10.10") ?: "10.10.10.10") }
     var activeAddress by rememberSaveable { mutableStateOf(address) }
     var lightTheme by remember { mutableStateOf(preferences.getBoolean("light-theme", false)) }
-    var demoMode by rememberSaveable { mutableStateOf(false) }
     var liveStatus by remember { mutableStateOf<ControllerStatus?>(null) }
     var demoStatus by remember { mutableStateOf(createDemoStatus()) }
     var connectionError by remember { mutableStateOf<String?>(null) }
@@ -184,6 +311,7 @@ private fun IraNativeApp(isForeground: Boolean, networkProvider: () -> Network?)
     val toastQueue = remember { Channel<QueuedToast>(Channel.UNLIMITED) }
     var visibleToast by remember { mutableStateOf<QueuedToast?>(null) }
     val isConnected = liveStatus != null && connectionError == null
+    val demoMode = !isConnected
     val displayedStatus = if (demoMode) demoStatus else liveStatus
     val colors = if (lightTheme) {
         lightColorScheme(
@@ -236,8 +364,8 @@ private fun IraNativeApp(isForeground: Boolean, networkProvider: () -> Network?)
         }
     }
 
-    LaunchedEffect(api, demoMode, isForeground) {
-        if (!demoMode && isForeground) {
+    LaunchedEffect(api, isForeground) {
+        if (isForeground) {
             var previousSta: Boolean? = null
             var previousReady: Boolean? = null
             var previousResetCount: Long? = null
@@ -276,6 +404,9 @@ private fun IraNativeApp(isForeground: Boolean, networkProvider: () -> Network?)
     }
 
     MaterialTheme(colorScheme = colors) {
+        if (isConnected || demoMode) {
+            ControllerWebDashboard(address = activeAddress, demoMode = !isConnected)
+        } else {
         Box(Modifier.fillMaxSize().background(
             if (lightTheme) Brush.linearGradient(listOf(Color(0xFFDCEFE1), Color(0xFFF8FFF9)))
             else Brush.linearGradient(listOf(DeepGreen, Color(0xFF0A2A1D), DeepGreen)),
@@ -346,8 +477,6 @@ private fun IraNativeApp(isForeground: Boolean, networkProvider: () -> Network?)
                                 connectionError = null
                                 timersLoaded = false
                             },
-                            demoMode = demoMode,
-                            onDemoChange = { demoMode = it },
                         )
                     }
 
@@ -436,7 +565,149 @@ private fun IraNativeApp(isForeground: Boolean, networkProvider: () -> Network?)
                 ToastCard(visibleToast)
             }
         }
+        }
     }
+}
+
+@Composable
+private fun ControllerWebDashboard(address: String, demoMode: Boolean) {
+    val context = LocalContext.current
+    AndroidView(
+        modifier = Modifier.fillMaxSize(),
+        factory = { viewContext ->
+            WebView(viewContext).apply {
+                layoutParams = ViewGroup.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                )
+                setBackgroundColor(android.graphics.Color.rgb(4, 27, 19))
+                settings.javaScriptEnabled = true
+                settings.domStorageEnabled = true
+                settings.loadsImagesAutomatically = true
+                settings.allowFileAccess = true
+                settings.allowContentAccess = false
+                webChromeClient = WebChromeClient()
+                addJavascriptInterface(AnalyzerDownloadBridge(context), "IraAndroid")
+                webViewClient = object : WebViewClient() {
+                    override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
+                        val dashboardOrigin = "http://${address.trim().trimEnd('/')}/"
+                        return !request.url.toString().startsWith(dashboardOrigin)
+                    }
+
+                    override fun onPageFinished(view: WebView, url: String) {
+                        installAnalyzerDownloads(view)
+                        installMobileStopButtonLayout(view)
+                    }
+                }
+                loadControllerDashboard(this, address, demoMode)
+            }
+        },
+        update = { view ->
+            val renderKey = "${address.trim().trimEnd('/')}|$demoMode"
+            if (view.tag != renderKey) {
+                loadControllerDashboard(view, address, demoMode)
+            }
+        },
+        onRelease = { view ->
+            view.stopLoading()
+            view.removeJavascriptInterface("IraAndroid")
+            view.destroy()
+        },
+    )
+}
+
+private fun loadControllerDashboard(view: WebView, address: String, demoMode: Boolean) {
+    val normalizedAddress = address.trim().trimEnd('/').ifBlank { "10.10.10.10" }
+    val renderKey = "$normalizedAddress|$demoMode"
+    view.tag = renderKey
+    if (demoMode) {
+        val html = view.context.assets.open("index.html").bufferedReader(Charsets.UTF_8).use { it.readText() }
+        val mock = view.context.assets.open("demo-mode.js").bufferedReader(Charsets.UTF_8).use { it.readText() }
+        val charsetTag = "<meta charset=\"utf-8\">"
+        view.loadDataWithBaseURL(
+            "http://$normalizedAddress/",
+            html.replace(charsetTag, "$charsetTag<script>$mock</script>"),
+            "text/html",
+            "UTF-8",
+            null,
+        )
+    } else {
+        view.loadUrl("http://$normalizedAddress/")
+    }
+}
+
+private class AnalyzerDownloadBridge(private val context: Context) {
+    @JavascriptInterface
+    fun saveFile(fileName: String, base64Data: String, mimeType: String) {
+        runCatching {
+            val safeName = File(fileName).name.ifBlank { "ira-analyzer-export.txt" }
+            val bytes = Base64.decode(base64Data, Base64.DEFAULT)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                val values = ContentValues().apply {
+                    put(MediaStore.Downloads.DISPLAY_NAME, safeName)
+                    put(MediaStore.Downloads.MIME_TYPE, mimeType.ifBlank { "text/plain" })
+                    put(MediaStore.Downloads.IS_PENDING, 1)
+                }
+                val uri = context.contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                    ?: error("Could not create the download")
+                context.contentResolver.openOutputStream(uri)?.use { it.write(bytes) }
+                    ?: error("Could not write the download")
+                context.contentResolver.update(uri, ContentValues().apply {
+                    put(MediaStore.Downloads.IS_PENDING, 0)
+                }, null, null)
+            } else {
+                val directory = context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
+                    ?: error("Downloads folder is unavailable")
+                File(directory, safeName).writeBytes(bytes)
+            }
+            Toast.makeText(context, "Analyzer export saved: $safeName", Toast.LENGTH_LONG).show()
+        }.onFailure { error ->
+            Toast.makeText(context, error.message ?: "Could not save analyzer export", Toast.LENGTH_LONG).show()
+        }
+    }
+}
+
+private fun installAnalyzerDownloads(webView: WebView) {
+    val script = """
+        (function() {
+          if (window.__iraAndroidDownloads) return;
+          window.__iraAndroidDownloads = true;
+          document.addEventListener('click', function(event) {
+            var link = event.target && event.target.closest ? event.target.closest('a[download]') : null;
+            if (!link || !link.href || !link.href.startsWith('blob:')) return;
+            event.preventDefault();
+            fetch(link.href).then(function(response) { return response.blob(); }).then(function(blob) {
+              var reader = new FileReader();
+              reader.onloadend = function() {
+                var base64 = String(reader.result).split(',')[1] || '';
+                window.IraAndroid.saveFile(link.download || 'ira-analyzer-export.txt', base64, blob.type || 'text/plain');
+              };
+              reader.readAsDataURL(blob);
+            });
+          }, true);
+        })();
+    """.trimIndent()
+    webView.evaluateJavascript(script, null)
+}
+
+private fun installMobileStopButtonLayout(webView: WebView) {
+    val script = """
+        (function() {
+          var styleId = 'ira-android-mobile-stop-layout';
+          var css = '@media (max-width:620px) {' +
+            'main { padding-bottom:clamp(14px,3vw,28px) !important; }' +
+            '#stopSeq { position:static !important; left:auto !important; right:auto !important; bottom:auto !important; z-index:auto !important; width:100% !important; min-height:48px; grid-column:1 / -1 !important; border-radius:16px !important; }' +
+            '} @media (max-width:420px) { main { padding-bottom:12px !important; } }';
+          var style = document.getElementById(styleId);
+          if (!style) {
+            style = document.createElement('style');
+            style.id = styleId;
+            (document.head || document.documentElement).appendChild(style);
+          }
+          style.textContent = css;
+        })();
+    """.trimIndent()
+    webView.evaluateJavascript(script, null)
 }
 
 @Composable
@@ -579,20 +850,17 @@ private fun ConnectionCard(
     onAddressChange: (String) -> Unit,
     error: String?,
     onReconnect: () -> Unit,
-    demoMode: Boolean,
-    onDemoChange: (Boolean) -> Unit,
 ) {
     val context = LocalContext.current
     PanelCard {
         Text("Connect to your controller", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
         Text(
-            if (demoMode) "Preview mode is active. Commands stay on this phone and do not reach hardware."
-            else error ?: "Connect your phone to the Repair Center Wi-Fi.",
+            "Preview mode is active because the controller is not connected. Commands stay on this phone and do not reach hardware.",
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             style = MaterialTheme.typography.bodySmall,
         )
-        if (!demoMode) Text(
-            "This Wi-Fi has no internet, so Android may switch to mobile data. In Wi-Fi settings, choose the controller network and select Stay connected / Use this network if prompted. The app sends controller traffic over the Wi-Fi connection.",
+        Text(
+            error ?: "Connect your phone to the Repair Center Wi-Fi. This Wi-Fi has no internet, so choose Stay connected / Use this network if Android prompts you.",
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             style = MaterialTheme.typography.bodySmall,
         )
@@ -604,13 +872,6 @@ private fun ConnectionCard(
             "📶 Open Wi-Fi settings", TactileStyle.TOOL, modifier = Modifier.fillMaxWidth(), cornerRadius = 14.dp,
         ) {
             context.startActivity(Intent(Settings.ACTION_WIFI_SETTINGS))
-        }
-        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween, modifier = Modifier.fillMaxWidth()) {
-            Column(Modifier.weight(1f)) {
-                Text("Preview dashboard", fontWeight = FontWeight.SemiBold)
-                Text("Try the interface without hardware; actions stay on this phone.", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
-            }
-            Switch(checked = demoMode, onCheckedChange = onDemoChange)
         }
     }
 }
