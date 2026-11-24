@@ -36,6 +36,10 @@
   - All outputs (incl. Brake/Enable) are locked while an automatic sequence runs.
   - Same-origin check on all state-changing POST requests (CSRF); no login added.
   - Analyzer JSON is streamed (no large String), beep timer is rollover-safe.
+  - Modbus RTU slave and passive monitor frame by silence (3.5 chars, 1.75 ms above 19200 baud),
+    not by assumed length. CAN reconfigure only reports success if the new settings are running.
+  - Stop / physical reset ramps outputs down (speed, direction, Enable, Brake); a second Stop
+    at least 1 s later cuts everything immediately. Client-join buzzer: one 1 s beep, 10 s cooldown.
 
   Arduino IDE board configuration:
     * Select an ESP32-S3 Dev Module (or the exact vendor board if available).
@@ -95,7 +99,13 @@ static constexpr int PIN_RESET_BUTTON = 42; // button to GND, active LOW
 static constexpr int PIN_READY_BUTTON = 14; // button to GND, active LOW
 static constexpr int PIN_READY_RELAY = 11;  // active-HIGH relay module: LOW=OFF, HIGH=ON
 static constexpr int PIN_BUZZER_RELAY = 12; // active-HIGH relay driver
-static constexpr uint32_t BUZZER_PULSE_MS = 2000UL;
+static constexpr uint32_t BUZZER_PULSE_MS = 2000UL;           // post-Run-Mode reminder pulse
+static constexpr uint32_t FAILSAFE_RESTART_DELAY_MS = 10000UL; // fatal init error: outputs LOW, then reboot after this delay
+static constexpr uint32_t READY_PRESS_DEBOUNCE_MS = 35UL;    // Ready button press must be stable this long
+static constexpr uint32_t READY_RELEASE_DEBOUNCE_MS = 25UL;   // Ready button release must be stable this long (keep <= press debounce)
+static constexpr uint32_t RUNMODE_BRAKE_PAUSE_MS = 2000UL;   // brake-off pause between Run Mode directions
+static constexpr uint32_t CLIENT_BEEP_MS = 1000UL;           // one beep when a Wi-Fi client connects
+static constexpr uint32_t CLIENT_BEEP_COOLDOWN_MS = 10000UL;  // further joins within this window are ignored (anti-spam)
 
 static constexpr gpio_num_t PIN_CAN_TX = GPIO_NUM_18;
 static constexpr gpio_num_t PIN_CAN_RX = GPIO_NUM_21;
@@ -442,7 +452,9 @@ String makeStatusJson(bool includeDiagnostics = true) {
   String json;
   json.reserve(1900);
   json = "{\"apSsid\":\"" + jsonEscape(apSSID) + "\",\"apIp\":\"" + WiFi.softAPIP().toString();
-  json += "\",\"staConnected\":";
+  json += "\",\"staConfigured\":";
+  json += staSSID.length() ? "true" : "false";
+  json += ",\"staConnected\":";
   json += (WiFi.status() == WL_CONNECTED) ? "true" : "false";
   json += ",\"staIp\":\"" + WiFi.localIP().toString() + "\",\"apClients\":" + String(WiFi.softAPgetStationNum());
   json += ",\"canBitrate\":" + String(canBitrate) + ",\"uartBaud\":" + String(uartBaud);
@@ -585,8 +597,9 @@ bool modbusSetTimer(uint16_t address, uint16_t value) {
   return true;
 }
 
+// Called once per silence-delimited frame (see communicationTask), so `length` is the real frame length.
 void modbusProcessFrame(const uint8_t *frame, size_t length) {
-  if (length < 4) return;
+  if (length < 4) { ++modbusErrorCount; return; } // runt frame / line noise
   const uint16_t expectedCrc = (uint16_t)frame[length - 2] | ((uint16_t)frame[length - 1] << 8);
   if (modbusCrc16(frame, length - 2) != expectedCrc) { ++modbusErrorCount; return; }
   if (frame[0] != MODBUS_SLAVE_ID) return;
@@ -596,6 +609,7 @@ void modbusProcessFrame(const uint8_t *frame, size_t length) {
   snprintf(eventText, sizeof(eventText), "Modbus RTU RX ID=%u FC=0x%02X", frame[0], function);
   addAnalyzerEvent("serial", eventText);
   if (function == 0x03) {
+    if (length != 8) { modbusException(function, 3); return; }
     const uint16_t start = ((uint16_t)frame[2] << 8) | frame[3];
     const uint16_t count = ((uint16_t)frame[4] << 8) | frame[5];
     if (count == 0 || count > 125) { modbusException(function, 3); return; }
@@ -611,6 +625,7 @@ void modbusProcessFrame(const uint8_t *frame, size_t length) {
     return;
   }
   if (function == 0x06) {
+    if (length != 8) { modbusException(function, 3); return; }
     const uint16_t address = ((uint16_t)frame[2] << 8) | frame[3];
     const uint16_t value = ((uint16_t)frame[4] << 8) | frame[5];
     bool ok = address == 0 ? modbusSetCommand(value) : modbusSetTimer(address, value);
@@ -626,6 +641,7 @@ void modbusProcessFrame(const uint8_t *frame, size_t length) {
     return;
   }
   if (function == 0x10) {
+    if (length < 9 || length != (size_t)9 + frame[6]) { modbusException(function, 3); return; }
     const uint16_t start = ((uint16_t)frame[2] << 8) | frame[3];
     const uint16_t count = ((uint16_t)frame[4] << 8) | frame[5];
     if (count == 0 || count > 123 || frame[6] != count * 2) { modbusException(function, 3); return; }
@@ -645,20 +661,6 @@ void modbusProcessFrame(const uint8_t *frame, size_t length) {
     return;
   }
   modbusException(function, 1);
-}
-
-void modbusProcessByte(uint8_t value, uint8_t *buffer, size_t &length, size_t &expectedLength) {
-  if (length >= MODBUS_MAX_ADU) { length = expectedLength = 0; ++modbusErrorCount; }
-  buffer[length++] = value;
-  if (length == 2) {
-    const uint8_t function = buffer[1];
-    expectedLength = (function == 0x10) ? 0 : 8;
-  }
-  if (length >= 7 && buffer[1] == 0x10 && expectedLength == 0) expectedLength = 9 + buffer[6];
-  if (expectedLength && length >= expectedLength) {
-    modbusProcessFrame(buffer, expectedLength);
-    length = expectedLength = 0;
-  }
 }
 
 void passiveModbusProcessFrame(const uint8_t *frame, size_t length) {
@@ -690,49 +692,39 @@ void passiveModbusProcessFrame(const uint8_t *frame, size_t length) {
     monitorReadCount = 0;
     return;
   }
+  if ((function & 0x80) && length == 5) { // exception response: ID, FC|0x80, code, CRC
+    snprintf(eventText, sizeof(eventText), "RTU exception ID=%u FC=0x%02X code=%u", unit, function & 0x7F, frame[2]);
+    addAnalyzerEvent("serial", eventText);
+    return;
+  }
   snprintf(eventText, sizeof(eventText), "RTU frame ID=%u FC=0x%02X len=%u", unit, function, (unsigned)length);
   addAnalyzerEvent("serial", eventText);
 }
 
-void passiveModbusProcessByte(uint8_t value, uint8_t *buffer, size_t &length, size_t &expectedLength) {
-  if (length >= MODBUS_MAX_ADU) { length = expectedLength = 0; ++modbusErrorCount; }
-  buffer[length++] = value;
-  if (length == 2) expectedLength = 8;
-  if (length >= 3 && (buffer[1] == 0x03 || buffer[1] == 0x04)) {
-    const size_t responseLength = 5U + buffer[2];
-    if (responseLength > 8) expectedLength = responseLength;
-    if (length == responseLength && responseLength >= 7 && responseLength != 8) {
-      const uint16_t crc = (uint16_t)buffer[length - 2] | ((uint16_t)buffer[length - 1] << 8);
-      if (modbusCrc16(buffer, length - 2) == crc) {
-        passiveModbusProcessFrame(buffer, responseLength);
-        length = expectedLength = 0;
-        return;
-      }
+bool modbusCrcOk(const uint8_t *frame, size_t length) {
+  if (length < 4) return false;
+  const uint16_t expected = (uint16_t)frame[length - 2] | ((uint16_t)frame[length - 1] << 8);
+  return modbusCrc16(frame, length - 2) == expected;
+}
+
+// Passive monitor: one silence-delimited buffer normally holds exactly one RTU frame. If the
+// comms task was starved across an inter-frame gap and two frames merged, split them using the
+// lengths the supported function codes can have (exception 5, request / write response 8,
+// read response 5+byteCount, write-multiple request 9+byteCount) and confirm each by CRC.
+void passiveModbusProcessBuffer(const uint8_t *buf, size_t len) {
+  while (len >= 4) {
+    if (modbusCrcOk(buf, len)) { passiveModbusProcessFrame(buf, len); return; }
+    const size_t candidates[4] = {5, 8, (size_t)5 + (len > 2 ? buf[2] : 0), (size_t)9 + (len > 6 ? buf[6] : 0)};
+    size_t cut = 0;
+    for (size_t c : candidates) {
+      if (c >= 4 && c < len && modbusCrcOk(buf, c)) { cut = c; break; }
     }
+    if (!cut) { ++modbusErrorCount; return; } // corrupted / unrecognised frame
+    passiveModbusProcessFrame(buf, cut);
+    buf += cut;
+    len -= cut;
   }
-  if (length == 8 && modbusCrc16(buffer, 6) == ((uint16_t)buffer[6] | ((uint16_t)buffer[7] << 8))) {
-    passiveModbusProcessFrame(buffer, 8);
-    length = expectedLength = 0;
-    return;
-  }
-  if (length >= 7 && buffer[1] == 0x10) expectedLength = 9U + buffer[6];
-  if (length == 8 && buffer[1] != 0x10 && buffer[1] != 0x03 && buffer[1] != 0x04) {
-    ++modbusErrorCount;
-    length = expectedLength = 0;
-    return;
-  }
-  if (length == 8 && (buffer[1] == 0x03 || buffer[1] == 0x04) && 5U + buffer[2] <= 8) {
-    ++modbusErrorCount;
-    length = expectedLength = 0;
-    return;
-  }
-  if (expectedLength > 8 && length == expectedLength) {
-    passiveModbusProcessFrame(buffer, expectedLength);
-    length = expectedLength = 0;
-  } else if (length >= MODBUS_MAX_ADU) {
-    length = expectedLength = 0;
-    ++modbusErrorCount;
-  }
+  if (len) ++modbusErrorCount; // trailing fragment
 }
 
 const char INDEX_HTML[] PROGMEM =
@@ -773,11 +765,11 @@ const char INDEX_HTML[] PROGMEM =
   "<button data-name=\"Up\">Up</button><button data-name=\"Down\">Down</button>\n"
   "<button data-name=\"Speed 0\">Speed 0</button><button data-name=\"Speed 1\">Speed 1</button>\n"
   "<button data-name=\"Speed 2\">Speed 2</button><button class=\"run\" id=\"runMode\">Run Mode (1 hour)</button></div>\n"
-  "<p id=\"manualLockNotice\" class=\"manual-lock\" hidden>Output controls are locked during an automatic sequence. Press Stop to abort.</p>\n"
+  "<p id=\"manualLockNotice\" class=\"manual-lock\" hidden>Output controls are locked during an automatic sequence or ramp-down. Press Stop to ramp down; press it again to cut outputs immediately.</p>\n"
   "<h3>Automatic sequences</h3><div class=\"controls\">\n"
   "<button class=\"seq\" id=\"autoUp\">Auto UP</button><button class=\"seq\" id=\"autoDown\">Auto DOWN</button>\n"
   "<button class=\"stop\" id=\"stopSeq\">Stop sequence / Run Mode</button>\n"
-  "</div><p class=\"muted\">Ready Signal: Switch to Timer; configured delay the relay turns ON. The buzzer beeps twice for 2 seconds each when an access-point client connects. After Run Mode completes, the Buzzer relay gives 2-second pulses until Stop is pressed.</p><p id=\"seqStatus\" class=\"muted\">Sequence: Idle</p><div class=\"seq-progress\" aria-live=\"polite\"><div class=\"seq-progress-head\"><strong id=\"seqStepName\">Waiting for sequence</strong><span id=\"seqStepTime\">—</span></div><div class=\"seq-track\"><div id=\"seqProgressBar\" class=\"seq-fill\"></div></div><div class=\"seq-progress-foot\"><span id=\"seqDirection\">Direction: —</span><span id=\"seqStepDetail\">Step progress appears while running</span></div></div></div>\n"
+  "</div><p class=\"muted\">Ready Signal: Switch to Timer; configured delay the relay turns ON. The buzzer gives one 1-second beep when an access-point client connects (repeat connections within 10 seconds are ignored). After Run Mode completes, the Buzzer relay gives 2-second pulses until Stop is pressed. Stop ramps the outputs down in order (speed, direction, Enable, Brake) instead of cutting them at once; press Stop again to cut every output immediately.</p><p id=\"seqStatus\" class=\"muted\">Sequence: Idle</p><div class=\"seq-progress\" aria-live=\"polite\"><div class=\"seq-progress-head\"><strong id=\"seqStepName\">Waiting for sequence</strong><span id=\"seqStepTime\">—</span></div><div class=\"seq-track\"><div id=\"seqProgressBar\" class=\"seq-fill\"></div></div><div class=\"seq-progress-foot\"><span id=\"seqDirection\">Direction: —</span><span id=\"seqStepDetail\">Step progress appears while running</span></div></div></div>\n"
   "<details class=\"card collapsible\"><summary>Sequence timer settings</summary><div class=\"collapse-body\"><p class=\"muted\">Choose each sequence-step duration, Buzzer pulse interval, Ready Signal delay (1–600 seconds), and Run Mode duration (1–24 hours). Settings are saved to ESP32 nonvolatile memory (NVS). The buzzer gives a 2-second pulse every selected interval after Run Mode completes; Stop silences it.</p>\n"
   "<form id=\"timerForm\"><div id=\"timerFields\" class=\"controls\"></div><div class=\"actions\"><button type=\"submit\">Save sequence timers</button><button type=\"button\" id=\"reloadTimers\">Reload saved timers</button></div></form><p id=\"timerMessage\" class=\"muted\"></p></div></details>\n"
   "<details class=\"card collapsible\"><summary>Wi-Fi configuration</summary><div class=\"collapse-body\">\n"
@@ -847,11 +839,11 @@ const char INDEX_HTML[] PROGMEM =
   "let savedTheme='dark';try{savedTheme=localStorage.getItem('repairCenterTheme')||'dark';}catch(e){}setTheme(savedTheme==='light'?'light':'dark');themeToggle.addEventListener('click',()=>setTheme(root.dataset.theme==='dark'?'light':'dark'));\n"
   "const buttons=[...document.querySelectorAll('[data-name]')];let states={};let refreshTimer=null,lastSequenceActive=false,lastStaConnected=null,lastReadyRelayOn=null,lastPhysicalResetPressCount=null,lastPhysicalResetButtonPressed=null,statusErrorCount=0,serialRateInitialized=false,uartModeInitialized=false,activeUartMode='modbus';\n"
   "function setConnectionState(online){const el=document.getElementById('connectionLine');el.classList.toggle('live',online);el.classList.toggle('offline',!online);el.classList.remove('connecting');document.getElementById('connectionState').textContent=online?'Live · updated '+new Date().toLocaleTimeString():'Connection lost · retrying';}\n"
-  "function applyManualLocks(){const lockedNames=['Brake','Enable','Up','Down','Speed 0','Speed 1','Speed 2'];buttons.forEach(b=>{const locked=lastSequenceActive&&lockedNames.includes(b.dataset.name);b.disabled=locked;b.setAttribute('aria-disabled',String(locked));});document.getElementById('manualLockNotice').hidden=!lastSequenceActive;}\n"  "function updateDiagnostics(s){const set=(id,value)=>{const el=document.getElementById(id);if(el)el.textContent=value;};const good=(id,ok)=>{const el=document.getElementById(id);if(el)el.style.color=ok?'var(--good, #36c878)':'var(--bad, #f87171)';};set('diagControl',s.controlTaskHealthy?'Running':'Heartbeat stale');good('diagControl',!!s.controlTaskHealthy);set('diagControlDetail','Last heartbeat '+(s.controlHeartbeatAgeMs??'—')+' ms ago');set('diagReset',s.resetButtonPressed?'Pressed / LOW':'Released / HIGH');good('diagReset',!s.resetButtonPressed);set('diagResetDetail','GPIO42 · '+Number(s.physicalResetPressCount||0)+' debounced press(es)');set('diagHeap',(Number(s.minFreeHeap||0)/1024).toFixed(1)+' KB');set('diagHeapDetail','Current '+(Number(s.freeHeap||0)/1024).toFixed(1)+' KB free');set('diagWifi',s.apActive?'Active':'Not active');good('diagWifi',!!s.apActive);set('diagWifiDetail',(s.apClients||0)+' connected client(s) · '+(s.apIp||'no IP'));set('diagSta',s.staConnected?'Connected':'Disconnected');good('diagSta',!!s.staConnected);set('diagStaDetail',s.staConnected?(s.staIp||'Connected'):'Optional router connection');const cs=s.canBusState===1?'Running':s.canBusState===2?'BUS-OFF':s.canBusState===3?'Recovering':(s.canDriverReady?'Unknown':'Stopped / unavailable');set('diagCan',cs);good('diagCan',s.canDriverReady&&s.canBusState===1);set('diagCanDetail',(s.canErrors||0)+' error(s) · '+(s.canRx||0)+' RX frames');set('diagBuffer',(s.analyzerCount||0)+' / '+(s.analyzerCapacity||80));good('diagBuffer',(s.analyzerCount||0)<(s.analyzerCapacity||80));set('diagBufferDetail','Ring buffer occupancy');set('diagStack',s.controlStackHighWaterWords==null?'Unavailable':('ctl '+s.controlStackHighWaterWords+' / comms '+(s.commsStackHighWaterWords??'—')+' / led '+(s.ledStackHighWaterWords??'—')+' words'));set('diagLoss',(s.analyzerDropped||0)+' analyzer');set('diagLossDetail',(s.uartDropped||0)+' UART overflow event(s)');set('diagUpdated','Updated '+new Date().toLocaleTimeString());}\n"
+  "function applyManualLocks(){const lockedNames=['Brake','Enable','Up','Down','Speed 0','Speed 1','Speed 2'];buttons.forEach(b=>{const locked=lastSequenceActive&&lockedNames.includes(b.dataset.name);b.disabled=locked;b.setAttribute('aria-disabled',String(locked));});document.getElementById('manualLockNotice').hidden=!lastSequenceActive;}\n"  "function updateDiagnostics(s){const set=(id,value)=>{const el=document.getElementById(id);if(el)el.textContent=value;};const good=(id,ok)=>{const el=document.getElementById(id);if(el)el.style.color=ok?'var(--good, #36c878)':'var(--bad, #f87171)';};set('diagControl',s.controlTaskHealthy?'Running':'Heartbeat stale');good('diagControl',!!s.controlTaskHealthy);set('diagControlDetail','Last heartbeat '+(s.controlHeartbeatAgeMs??'—')+' ms ago');set('diagReset',s.resetButtonPressed?'Pressed / LOW':'Released / HIGH');good('diagReset',!s.resetButtonPressed);set('diagResetDetail','GPIO42 · '+Number(s.physicalResetPressCount||0)+' debounced press(es)');set('diagHeap',(Number(s.minFreeHeap||0)/1024).toFixed(1)+' KB');set('diagHeapDetail','Current '+(Number(s.freeHeap||0)/1024).toFixed(1)+' KB free');set('diagWifi',s.apActive?'Active':'Not active');good('diagWifi',!!s.apActive);set('diagWifiDetail',(s.apClients||0)+' connected client(s) · '+(s.apIp||'no IP'));set('diagSta',s.staConnected?'Connected':(s.staConfigured?'Disconnected':'Not configured'));good('diagSta',!!s.staConnected);if(!s.staConfigured){const el=document.getElementById('diagSta');if(el)el.style.color='';}set('diagStaDetail',s.staConnected?(s.staIp||'Connected'):'Optional router connection');const cs=s.canBusState===1?'Running':s.canBusState===2?'BUS-OFF':s.canBusState===3?'Recovering':(s.canDriverReady?'Unknown':'Stopped / unavailable');set('diagCan',cs);good('diagCan',s.canDriverReady&&s.canBusState===1);set('diagCanDetail',(s.canErrors||0)+' error(s) · '+(s.canRx||0)+' RX frames');set('diagBuffer',(s.analyzerCount||0)+' / '+(s.analyzerCapacity||80));good('diagBuffer',(s.analyzerCount||0)<(s.analyzerCapacity||80));set('diagBufferDetail','Ring buffer occupancy');set('diagStack',s.controlStackHighWaterWords==null?'Unavailable':('ctl '+s.controlStackHighWaterWords+' / comms '+(s.commsStackHighWaterWords??'—')+' / led '+(s.ledStackHighWaterWords??'—')+' words'));set('diagLoss',(s.analyzerDropped||0)+' analyzer');set('diagLossDetail',(s.uartDropped||0)+' UART overflow event(s)');set('diagUpdated','Updated '+new Date().toLocaleTimeString());}\n"
   "async function refresh(){if(document.visibilityState!=='visible'){clearTimeout(refreshTimer);refreshTimer=setTimeout(refresh,10000);return;}let pollDelay=5000;try{const diagnosticsOpen=document.getElementById('diagnosticsPanel').open;const r=await fetch('/api/status'+(diagnosticsOpen?'':'?compact=1'),{cache:'no-store'});const s=await r.json();const resetCount=Number(s.physicalResetPressCount||0);const resetPressed=!!s.resetButtonPressed;if((lastPhysicalResetPressCount===null&&resetPressed)||(lastPhysicalResetPressCount!==null&&resetCount>lastPhysicalResetPressCount)||(lastPhysicalResetButtonPressed===false&&resetPressed))showToast('Physical reset button pressed');lastPhysicalResetPressCount=resetCount;lastPhysicalResetButtonPressed=resetPressed;if(resetPressed)pollDelay=500;setConnectionState(true);if(!serialRateInitialized){document.getElementById('serialRate').value=String(s.uartBaud);serialRateInitialized=true;}if(!uartModeInitialized){activeUartMode=s.uartMode||'modbus';document.getElementById('uartMode').value=activeUartMode;updateUartModeControls();uartModeInitialized=true;}statusErrorCount=0;if(diagnosticsOpen)updateDiagnostics(s);states=s.outputs||{};lastSequenceActive=!!s.sequenceRunning;applyManualLocks();if(lastStaConnected!==null&&lastStaConnected!==!!s.staConnected)showToast(s.staConnected?'Router Wi-Fi connected':'Router Wi-Fi disconnected',s.staConnected?'':'warn');lastStaConnected=!!s.staConnected;if(lastReadyRelayOn!==null&&lastReadyRelayOn!==!!s.readyRelayOn&&s.readyRelayOn)showToast('Ready signal is ON');lastReadyRelayOn=!!s.readyRelayOn;\n"
   "buttons.forEach(b=>{const on=!!states[b.dataset.name];b.classList.toggle('on',on);b.setAttribute('aria-pressed',String(on));});\n"
   " const canRateField=document.getElementById('canRate');if(canRateField&&document.activeElement!==canRateField)canRateField.value=String(s.canBitrate||500000);const canListenField=document.getElementById('canListen');if(canListenField&&document.activeElement!==canListenField)canListenField.checked=!!s.canListenOnly;const serialRateField=document.getElementById('serialRate');if(serialRateField&&document.activeElement!==serialRateField)serialRateField.value=String(s.uartBaud||115200);const apSsidField=document.getElementById('apSsid');if(apSsidField&&document.activeElement!==apSsidField)apSsidField.value=s.apSsid||'Repair Center';\n"
-  " const wifiPill=document.getElementById('wifiPill');wifiPill.classList.toggle('good',!!s.staConnected);wifiPill.classList.toggle('bad',!s.staConnected);document.getElementById('dashWifi').textContent=s.staConnected?'Connected':'Not connected';document.getElementById('dashRam').textContent=(Number(s.freeHeap||0)/1024).toFixed(1)+' / '+(Number(s.minFreeHeap||0)/1024).toFixed(1)+' KB';const safetyPill=document.getElementById('safetyPill');document.getElementById('dashSafety').textContent=s.safetyState||'UNKNOWN';safetyPill.classList.toggle('good',s.safetyState==='READY');safetyPill.classList.toggle('warn',s.safetyState==='RUNNING');safetyPill.classList.toggle('bad',s.safetyState==='FAULT');document.getElementById('dashIp').textContent=s.apIp||'Unavailable';document.getElementById('dashClients').textContent=`${s.apClients} connected`;document.getElementById('clientPill').classList.toggle('good',Number(s.apClients)>0);document.getElementById('status').textContent=`AP: ${s.apSsid} (${s.apIp})\\nSTA: ${s.staConnected?'connected':'not connected'}${s.staConnected?' — '+s.staIp:''}\\nAP clients: ${s.apClients}\\nFree heap current/minimum: ${(Number(s.freeHeap||0)/1024).toFixed(1)} / ${(Number(s.minFreeHeap||0)/1024).toFixed(1)} KB\\nController state: ${s.safetyState||'UNKNOWN'}\\nCAN bus: ${['Unknown/stopped','Running','BUS-OFF','Recovering'][Number(s.canBusState)||0]}\\nAnalyzer dropped records: ${s.analyzerDropped??'Open diagnostics'}\\nRGB status: ${!s.canDriverReady||s.canBusState===2?'FAULT':(s.sequenceRunning?'SEQUENCE':(s.apClients>0?'CONNECTED':'WAITING'))}\\nCAN RX frames: ${s.canRx??'—'}\\nModbus RX frames: ${s.modbusFrames??'—'}`;\n"
+  " const wifiPill=document.getElementById('wifiPill');wifiPill.classList.toggle('good',!!s.staConnected);wifiPill.classList.toggle('bad',!!s.staConfigured&&!s.staConnected);document.getElementById('dashWifi').textContent=s.staConnected?'Connected':(s.staConfigured?'Not connected':'Not configured');document.getElementById('dashRam').textContent=(Number(s.freeHeap||0)/1024).toFixed(1)+' / '+(Number(s.minFreeHeap||0)/1024).toFixed(1)+' KB';const safetyPill=document.getElementById('safetyPill');document.getElementById('dashSafety').textContent=s.safetyState||'UNKNOWN';safetyPill.classList.toggle('good',s.safetyState==='READY');safetyPill.classList.toggle('warn',s.safetyState==='RUNNING');safetyPill.classList.toggle('bad',s.safetyState==='FAULT');document.getElementById('dashIp').textContent=s.apIp||'Unavailable';document.getElementById('dashClients').textContent=`${s.apClients} connected`;document.getElementById('clientPill').classList.toggle('good',Number(s.apClients)>0);document.getElementById('status').textContent=`AP: ${s.apSsid} (${s.apIp})\\nSTA: ${s.staConnected?'connected':'not connected'}${s.staConnected?' — '+s.staIp:''}\\nAP clients: ${s.apClients}\\nFree heap current/minimum: ${(Number(s.freeHeap||0)/1024).toFixed(1)} / ${(Number(s.minFreeHeap||0)/1024).toFixed(1)} KB\\nController state: ${s.safetyState||'UNKNOWN'}\\nCAN bus: ${['Unknown/stopped','Running','BUS-OFF','Recovering'][Number(s.canBusState)||0]}\\nAnalyzer dropped records: ${s.analyzerDropped??'Open diagnostics'}\\nRGB status: ${!s.canDriverReady||s.canBusState===2?'FAULT':(s.sequenceRunning?'SEQUENCE':(s.apClients>0?'CONNECTED':'WAITING'))}\\nCAN RX frames: ${s.canRx??'—'}\\nModbus RX frames: ${s.modbusFrames??'—'}`;\n"
   " document.getElementById('seqStatus').textContent='Sequence: '+(s.sequenceStatus||'Idle')+(s.runModeActive?' — Run Mode active (up/down alternating; configured duration)':'');\n"
   " const rem=Math.max(0,Number(s.sequenceStepRemainingMs||0)),dur=Math.max(0,Number(s.sequenceStepDurationMs||0)),elapsed=Math.max(0,Number(s.sequenceStepElapsedMs||0));document.getElementById('seqStepName').textContent=s.sequenceRunning?(s.sequenceStatus||'Sequence running'):'Waiting for sequence';document.getElementById('seqStepTime').textContent=s.sequenceRunning?(Math.ceil(rem/1000)+' s remaining'):'—';document.getElementById('seqProgressBar').style.width=s.sequenceRunning&&dur?Math.min(100,elapsed/dur*100)+'%':'0%';document.getElementById('seqDirection').textContent='Direction: '+(s.sequenceDirection||'—');document.getElementById('seqStepDetail').textContent=s.sequenceRunning?('Elapsed '+Math.floor(elapsed/1000)+' s of '+Math.ceil(dur/1000)+' s'):'Progress appears while running';\n"
   " document.getElementById('autoUp').disabled=!!s.sequenceRunning;document.getElementById('autoDown').disabled=!!s.sequenceRunning;document.getElementById('runMode').disabled=!!s.sequenceRunning;\n"
@@ -1307,13 +1299,24 @@ void controlTask(void *parameter) {
   bool resetButtonStableState = HIGH;
   uint32_t resetButtonLastChangeMs = 0;
   bool physicalResetRequestPending = false;
-  uint8_t clientConnectBeepPulses = 0;
+  bool stopping = false;            // controlled ramp-down after Stop / reset button is in progress
+  uint32_t stopRequestedMs = 0;     // when the ramp-down began (a second Stop later cuts outputs at once)
+  bool clientConnectBeepPending = false;
   bool clientConnectBeepActive = false;
-  uint32_t clientConnectBeepNextMs = millis();
+  bool clientBeepCooldownActive = false;
+  uint32_t clientBeepCooldownUntilMs = 0;
   auto allSpeedsOff = []() { applyOutputChanges((1UL << 4) | (1UL << 5) | (1UL << 6), 0); };
   auto setOnlySpeed = [](int index) { applyOutputChanges((1UL << 4) | (1UL << 5) | (1UL << 6), 1UL << index); };
   auto beginStage = [&](Stage next, uint32_t durationMs, const char *label) {
-    stage = next; const uint32_t started = millis(); deadline = started + durationMs; updateSequenceStep(started, durationMs, label);
+    stage = next; const uint32_t started = millis(); deadline = started + durationMs;
+    updateSequenceStep(started, durationMs, stopping ? String("Stop: ") + label : String(label));
+  };
+  // Immediate cut of every output (used when nothing is energized, or on a second Stop press).
+  auto hardStop = [&](const char *status) {
+    stage = IDLE; stopping = false; setSequenceRunning(false); runModeActive = false; clearSequenceStep(); buzzerAfterRunMode = false;
+    if (!clientConnectBeepActive) { buzzerRelayOn = false; digitalWrite(PIN_BUZZER_RELAY, LOW); }
+    applyOutputChanges((1UL << OUTPUT_COUNT) - 1UL, 0);
+    setSequenceStatus(status);
   };
   auto beginCycle = [&](int direction) {
     directionIndex = direction;
@@ -1327,23 +1330,25 @@ void controlTask(void *parameter) {
     esp_task_wdt_reset();
     const uint32_t now = millis();
 
-    // Drain AP station-connect events into the control task's two-beep queue.
+    // Drain AP station-connect events. Anti-spam: any number of joins collapses into a single
+    // 1-second beep, and joins arriving during the cooldown window (e.g. a phone that keeps
+    // reconnecting) are discarded instead of being queued.
     uint8_t newApJoins = 0;
     portENTER_CRITICAL(&apJoinEventMux);
     newApJoins = pendingApJoinEvents;
     pendingApJoinEvents = 0;
     portEXIT_CRITICAL(&apJoinEventMux);
-    if (newApJoins) {
-      const uint8_t addedPulses = (uint8_t)(newApJoins * 2U);
-      const uint8_t room = (uint8_t)(20U - clientConnectBeepPulses);
-      clientConnectBeepPulses += addedPulses < room ? addedPulses : room;
-    }
+    // Checked every pass (~10 ms), so the signed compare can never go stale across millis() sign rollover.
+    if (clientBeepCooldownActive && (int32_t)(now - clientBeepCooldownUntilMs) >= 0) clientBeepCooldownActive = false;
+    if (newApJoins && !clientBeepCooldownActive && !clientConnectBeepActive) clientConnectBeepPending = true;
 
     // READY SIGNAL STATE MACHINE:
     // 1) Startup state is OFF (active-HIGH relay: LOW = OFF).
     // 2) A debounced press starts the configured delay; relay remains OFF.
     // 3) If the button is still held when the delay expires, relay turns ON.
-    // 4) A raw release immediately turns the relay OFF and cancels the delay.
+    // 4) A release that stays released for READY_RELEASE_DEBOUNCE_MS turns the relay OFF and
+    //    cancels the delay. Shorter glitches (contact bounce, EMI spikes on the pulled-up input)
+    //    are ignored so they cannot drop the relay mid-hold.
     // 5) Release synchronizes button state so the next press starts a fresh delay.
     const bool buttonReading = digitalRead(PIN_READY_BUTTON); // INPUT_PULLUP: LOW = pressed
     if (buttonReading != buttonLastReading) {
@@ -1351,19 +1356,20 @@ void controlTask(void *parameter) {
       buttonLastChangeMs = now;
     }
 
-    // Do not debounce the release safety path: release must switch OFF now.
-    if (buttonReading == HIGH) {
-      // Release is authoritative: cancel any pending delay and force relay OFF.
+    // Release is debounced with a short window (much shorter than the press debounce) so the
+    // relay still drops out almost immediately, but a brief noise spike cannot switch it OFF.
+    if (buttonReading == HIGH && (uint32_t)(now - buttonLastChangeMs) >= READY_RELEASE_DEBOUNCE_MS) {
+      // Confirmed release: cancel any pending delay and force relay OFF.
       // Synchronize the debounced state as well, so a quick subsequent press
       // can start a fresh delay cleanly.
       readyDelayPending = false;
       buttonStableState = HIGH;
       readyRelayOn = false;
-      digitalWrite(PIN_READY_RELAY, LOW); // active-HIGH relay OFF immediately on release
+      digitalWrite(PIN_READY_RELAY, LOW); // active-HIGH relay OFF after the release debounce
     }
 
-    // Debounce only the press edge before starting the timer.
-    if ((uint32_t)(now - buttonLastChangeMs) >= 35UL && buttonStableState != buttonReading) {
+    // Debounce the press edge before starting the timer.
+    if ((uint32_t)(now - buttonLastChangeMs) >= READY_PRESS_DEBOUNCE_MS && buttonStableState != buttonReading) {
       buttonStableState = buttonReading;
       if (buttonStableState == LOW && !readyRelayOn && !readyDelayPending) {
         readyDelayPending = true;
@@ -1394,24 +1400,21 @@ void controlTask(void *parameter) {
       }
     }
 
-    // Keep the beep timestamp fresh while idle so the signed-difference compare below
-    // can never go stale across the 24.8-day millis() sign boundary.
-    if (!clientConnectBeepActive && clientConnectBeepPulses == 0) clientConnectBeepNextMs = now;
-    // Client-join beeps take priority after any run-mode pulse already in progress.
+    // Client-join beep (one 1-second pulse) takes priority after any run-mode pulse already in progress.
     if (clientConnectBeepActive) {
       if ((int32_t)(now - buzzerPulseEndMs) >= 0) {
         clientConnectBeepActive = false;
         buzzerRelayOn = false;
         digitalWrite(PIN_BUZZER_RELAY, LOW);
-        clientConnectBeepNextMs = now + BUZZER_PULSE_MS;
       }
-    } else if (clientConnectBeepPulses && !buzzerRelayOn &&
-               (int32_t)(now - clientConnectBeepNextMs) >= 0) {
-      --clientConnectBeepPulses;
+    } else if (clientConnectBeepPending && !buzzerRelayOn) {
+      clientConnectBeepPending = false;
       clientConnectBeepActive = true;
       buzzerRelayOn = true;
-      buzzerPulseEndMs = now + BUZZER_PULSE_MS;
+      buzzerPulseEndMs = now + CLIENT_BEEP_MS;
       digitalWrite(PIN_BUZZER_RELAY, HIGH);
+      clientBeepCooldownActive = true;
+      clientBeepCooldownUntilMs = now + CLIENT_BEEP_COOLDOWN_MS;
     // Brief buzzer relay pulse at a configurable interval after Run Mode completes.
     } else if (buzzerAfterRunMode) {
       if (!buzzerRelayOn && (int32_t)(now - buzzerNextPulseMs) >= 0) {
@@ -1431,11 +1434,33 @@ void controlTask(void *parameter) {
     const uint8_t request = takeSequenceRequest();
     if (request == 3 || physicalResetRequestPending) {
       physicalResetRequestPending = false;
-      stage = IDLE; setSequenceRunning(false); runModeActive = false; clearSequenceStep(); buzzerAfterRunMode = false;
+      // Stop is a controlled ramp-down, not an instant cut: step the speed down, drop the direction,
+      // then Enable, then Brake, using the same "return" timers as a normal sequence finish.
+      // A second Stop at least 1 s into the ramp-down cuts every output immediately.
+      runModeActive = false; buzzerAfterRunMode = false;
       if (!clientConnectBeepActive) { buzzerRelayOn = false; digitalWrite(PIN_BUZZER_RELAY, LOW); }
-      // Stop all motion outputs and speed selections; de-energize outputs to a safe software state.
-      applyOutputChanges((1UL << OUTPUT_COUNT) - 1UL, 0);
-      setSequenceStatus("Stopped — outputs OFF");
+      if (stopping) {
+        if ((uint32_t)(millis() - stopRequestedMs) >= 1000UL) hardStop("Stopped immediately — outputs OFF");
+      } else {
+        bool st[OUTPUT_COUNT] = {};
+        copyOutputStates(st);
+        bool anyOn = false;
+        for (size_t i = 0; i < OUTPUT_COUNT; ++i) anyOn = anyOn || st[i];
+        if (!anyOn) {
+          hardStop("Stopped — outputs OFF");
+        } else {
+          stopping = true;
+          stopRequestedMs = millis();
+          directionIndex = st[3] ? 3 : 2;
+          setSequenceRunning(true); // keeps manual outputs locked until the ramp-down finishes
+          setSequenceStatus("Stopping — ramping down");
+          if (st[6])      { setOnlySpeed(5); beginStage(SPEED1_B, getSequenceTimerMs(T_SPEED1_B), "Speed 1 (return)"); }
+          else if (st[5]) { setOnlySpeed(4); beginStage(SPEED0_B, getSequenceTimerMs(T_SPEED0_B), "Speed 0 (return)"); }
+          else if (st[4] || st[2] || st[3]) beginStage(SPEED0_B, st[4] ? getSequenceTimerMs(T_SPEED0_B) : 0, "Speed 0 (return)");
+          else if (st[1]) beginStage(DIRECTION_OFF_WAIT, 0, "Enable OFF");
+          else            beginStage(ENABLE_OFF_WAIT, 0, "Brake OFF");
+        }
+      }
     } else if ((request == 1 || request == 2 || request == 4) && stage == IDLE) {
       runModeActive = (request == 4);
       if (runModeActive) {
@@ -1448,7 +1473,7 @@ void controlTask(void *parameter) {
     }
     // Run Mode expiry is handled at the end of the current cycle (ENABLE_OFF_WAIT and
     // RUNMODE_BRAKE_OFF_WAIT), so outputs are never cut mid-ramp. Stop / physical reset
-    // still halt everything immediately.
+    // start a controlled ramp-down (see above); pressing Stop again cuts everything immediately.
     if (stage != IDLE && (int32_t)(now - deadline) >= 0) {
       switch (stage) {
         case BRAKE_WAIT:
@@ -1473,12 +1498,12 @@ void controlTask(void *parameter) {
         case ENABLE_OFF_WAIT:
           setOutputState(0, false);
           if (runModeActive && (int32_t)(millis() - runModeEndMs) < 0) {
-            // Keep the brake de-energized for 2 seconds between Run Mode directions.
-            setOutputState(0, false);
-            beginStage(RUNMODE_BRAKE_OFF_WAIT, 2000, "Run Mode: Brake OFF pause (2 s)");
+            // Keep the brake de-energized between Run Mode directions (RUNMODE_BRAKE_PAUSE_MS).
+            beginStage(RUNMODE_BRAKE_OFF_WAIT, RUNMODE_BRAKE_PAUSE_MS, "Run Mode: Brake OFF pause");
           } else {
             stage = IDLE; setSequenceRunning(false);
-            if (runModeActive) { runModeActive = false; setSequenceStatus("Run Mode complete — outputs OFF"); buzzerAfterRunMode = true; buzzerNextPulseMs = millis(); }
+            if (stopping) { stopping = false; clearSequenceStep(); setSequenceStatus("Stopped — outputs OFF"); }
+            else if (runModeActive) { runModeActive = false; setSequenceStatus("Run Mode complete — outputs OFF"); buzzerAfterRunMode = true; buzzerNextPulseMs = millis(); }
             else setSequenceStatus("Completed");
           }
           break;
@@ -1507,7 +1532,7 @@ void controlTask(void *parameter) {
 void communicationTask(void *parameter) {
   uint8_t modbusBuffer[MODBUS_MAX_ADU];
   size_t modbusLength = 0;
-  size_t modbusExpectedLength = 0;
+  bool modbusFrameOverflow = false; // frame longer than MODBUS_MAX_ADU: discarded at the next silence
   uint32_t seenUartModeGeneration = uartModeGeneration;
   uint32_t lastCanRecoveryAttemptMs = 0;
   uint32_t lastUartRxUs = 0;
@@ -1522,21 +1547,17 @@ void communicationTask(void *parameter) {
     bool rawMode = false;
     if (uartMutex && xSemaphoreTake(uartMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
       if (seenUartModeGeneration != uartModeGeneration) {
-        modbusLength = modbusExpectedLength = 0;
+        modbusLength = 0;
+        modbusFrameOverflow = false;
         seenUartModeGeneration = uartModeGeneration;
       }
       rawMode = !modbusModeEnabled && !passiveMonitorEnabled;
       // RX buffer nearly full means bytes are about to be lost (counted as an overflow event).
       if (ExternalSerial.available() >= (int)UART_RX_BUFFER_SIZE - 16) ++uartDroppedBytes;
-      // Resynchronise the Modbus framers after an idle gap (>= 3.5 characters, never below 5 ms
-      // because this task polls every millisecond or so).
+      // Modbus RTU frames are delimited by silence: a frame ends after >= 3.5 character times
+      // without a byte (fixed 1.75 ms above 19200 baud, per the Modbus serial line spec).
       const uint32_t charUs = (11000000UL + uartBaud - 1UL) / uartBaud;
-      uint32_t gapUs = (charUs * 7UL) / 2UL;
-      if (gapUs < 5000UL) gapUs = 5000UL;
-      if (modbusLength && (uint32_t)(micros() - lastUartRxUs) > gapUs) {
-        modbusLength = modbusExpectedLength = 0;
-        ++modbusErrorCount; // incomplete / garbled frame discarded
-      }
+      const uint32_t gapUs = uartBaud > 19200UL ? 1750UL : (charUs * 7UL) / 2UL;
       size_t bytesThisPass = 0;
       while (ExternalSerial.available() && bytesThisPass < 256) {
         const int value = ExternalSerial.read();
@@ -1545,9 +1566,11 @@ void communicationTask(void *parameter) {
         ++uartRxCount;
         uartLastRxMs = millis();
         lastUartRxUs = micros();
-        if (modbusModeEnabled) modbusProcessByte((uint8_t)value, modbusBuffer, modbusLength, modbusExpectedLength);
-        else if (passiveMonitorEnabled) passiveModbusProcessByte((uint8_t)value, modbusBuffer, modbusLength, modbusExpectedLength);
-        else {
+        if (modbusModeEnabled || passiveMonitorEnabled) {
+          // Just collect: the frame is interpreted once the line goes silent (below).
+          if (modbusLength < MODBUS_MAX_ADU) modbusBuffer[modbusLength++] = (uint8_t)value;
+          else modbusFrameOverflow = true;
+        } else {
           const int wrote = snprintf(uartBatch + uartBatchLen, sizeof(uartBatch) - uartBatchLen, "%s%02X", uartBatchLen ? " " : "", (unsigned)(uint8_t)value);
           if (wrote > 0) uartBatchLen += (size_t)wrote;
           if (++uartBatchBytes >= 24) {
@@ -1557,6 +1580,18 @@ void communicationTask(void *parameter) {
             uartBatchLen = 0; uartBatchBytes = 0; uartBatch[0] = 0;
           }
         }
+      }
+      // End of frame = silence. Only decided on a pass that found no new byte, so a delayed pass
+      // (bytes already waiting in the FIFO) can never split a frame. The timestamp is taken when
+      // the last byte was read, which is never earlier than its arrival, so the true silence is at
+      // least the measured one and a frame is never closed early.
+      if ((modbusModeEnabled || passiveMonitorEnabled) && modbusLength && bytesThisPass == 0 &&
+          (uint32_t)(micros() - lastUartRxUs) >= gapUs) {
+        if (modbusFrameOverflow) ++modbusErrorCount;
+        else if (modbusModeEnabled) modbusProcessFrame(modbusBuffer, modbusLength);
+        else passiveModbusProcessBuffer(modbusBuffer, modbusLength);
+        modbusLength = 0;
+        modbusFrameOverflow = false;
       }
       xSemaphoreGive(uartMutex);
     }
@@ -1658,16 +1693,20 @@ bool startCan() {
   else if (canBitrate == 1000000) timing = TWAI_TIMING_CONFIG_1MBITS();
   else timing = TWAI_TIMING_CONFIG_500KBITS();
   twai_filter_config_t filter = TWAI_FILTER_CONFIG_ACCEPT_ALL();
+  // Strict: ESP_ERR_INVALID_STATE (driver already installed / started) is NOT success here, because
+  // it would mean the new bitrate / mode was silently not applied to the running driver.
   esp_err_t err = twai_driver_install(&general, &timing, &filter);
-  if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) return false;
+  if (err != ESP_OK) return false;
   err = twai_start();
-  if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) { twai_driver_uninstall(); return false; }
+  if (err != ESP_OK) { twai_driver_uninstall(); return false; }
   return true;
 }
 
 // Restart TWAI with a new bitrate and/or mode. Holds canMutex so the comms task and the
-// transmit handler cannot touch the driver while it is stopped or uninstalled. On failure
-// the previous settings are restored.
+// transmit handler cannot touch the driver while it is stopped or uninstalled.
+// Returns true ONLY if the new settings are really running. If the old driver cannot be
+// uninstalled (it keeps running with the old settings) or the new one fails to start, the
+// previous settings are restored and false is returned.
 bool reconfigureCan(uint32_t rate, bool listen) {
   if (!canMutex || xSemaphoreTake(canMutex, pdMS_TO_TICKS(1000)) != pdTRUE) return false;
   const uint32_t oldRate = canBitrate;
@@ -1675,31 +1714,67 @@ bool reconfigureCan(uint32_t rate, bool listen) {
   canDriverReady = false;
   canBusState = 0;
   canRecoveryPending = false;
-  twai_stop();
-  twai_driver_uninstall();
-  canBitrate = rate;
-  canListenOnly = listen;
-  bool ok = startCan();
-  if (!ok) {
-    canBitrate = oldRate;
-    canListenOnly = oldListen;
-    if (startCan()) canDriverReady = true;
+  twai_stop(); // ESP_ERR_INVALID_STATE only means "not running": fine, the uninstall below decides
+  const esp_err_t uninstallErr = twai_driver_uninstall();
+  twai_status_info_t info;
+  // If the uninstall failed AND the driver still answers, the old driver is still installed.
+  const bool oldDriverStillInstalled = (uninstallErr != ESP_OK) && (twai_get_status_info(&info) == ESP_OK);
+  bool ok = false;
+  if (oldDriverStillInstalled) {
+    addAnalyzerEvent("can", "CAN reconfigure failed: old driver could not be uninstalled");
+    const esp_err_t restartErr = twai_start(); // it was stopped above; bring it back with the OLD settings
+    canDriverReady = (restartErr == ESP_OK || restartErr == ESP_ERR_INVALID_STATE);
   } else {
-    canDriverReady = true;
+    canBitrate = rate;
+    canListenOnly = listen;
+    ok = startCan();
+    if (ok) {
+      canDriverReady = true;
+    } else {
+      addAnalyzerEvent("can", "CAN reconfigure failed: new driver did not start; restoring old settings");
+      canBitrate = oldRate;
+      canListenOnly = oldListen;
+      canDriverReady = startCan();
+    }
   }
   xSemaphoreGive(canMutex);
   return ok;
 }
 
+// Fatal initialisation error: drive every output LOW, report the reason on the LCD and serial
+// port, then reboot after FAILSAFE_RESTART_DELAY_MS so a transient fault (for example a Wi-Fi
+// start failure) recovers on its own instead of leaving a dead unit until a power cycle.
+// setup() drives all outputs LOW again at the start of every boot.
 void failSafeHalt(const char *reason) {
-  for (size_t i = 0; i < OUTPUT_COUNT; ++i) digitalWrite(OUTPUTS[i].pin, LOW);
-  digitalWrite(PIN_READY_RELAY, LOW);
-  digitalWrite(PIN_BUZZER_RELAY, LOW);
-  digitalWrite(PIN_MODBUS_DE, LOW);
   Serial.begin(115200);
   Serial.print("FATAL INIT: ");
   Serial.println(reason);
-  for (;;) delay(1000);
+  statusLcd.clear();
+  statusLcd.setCursor(0, 0);
+  statusLcd.print("INIT FAULT");
+  for (uint32_t remaining = FAILSAFE_RESTART_DELAY_MS / 1000UL; remaining > 0; --remaining) {
+    for (size_t i = 0; i < OUTPUT_COUNT; ++i) digitalWrite(OUTPUTS[i].pin, LOW);
+    digitalWrite(PIN_READY_RELAY, LOW);
+    digitalWrite(PIN_BUZZER_RELAY, LOW);
+    digitalWrite(PIN_MODBUS_DE, LOW);
+    char line[17];
+    snprintf(line, sizeof(line), "Restart in %2us ", (unsigned)remaining);
+    statusLcd.setCursor(0, 1);
+    statusLcd.print(line);
+    delay(1000);
+  }
+  Serial.println("Restarting...");
+  ESP.restart();
+}
+
+// Start the soft AP, retrying a few times: the IP configuration / AP start can fail transiently
+// right after Wi-Fi initialisation on some Arduino-ESP32 versions.
+bool startAccessPoint() {
+  for (uint8_t attempt = 0; attempt < 3; ++attempt) {
+    if (attempt) { WiFi.mode(WIFI_AP_STA); delay(300); }
+    if (WiFi.softAPConfig(AP_IP, AP_GATEWAY, AP_SUBNET) && WiFi.softAP(apSSID.c_str(), apPassword.c_str())) return true;
+  }
+  return false;
 }
 
 void setup() {
@@ -1734,7 +1809,9 @@ void setup() {
     failSafeHalt("FreeRTOS mutex allocation failed");
   }
 
-  prefs.begin("seq-timers", true);
+  // Namespaces are opened read-write: a read-only open of a namespace that does not exist yet
+  // (first boot) makes the NVS driver log "NOT_FOUND" errors. Read-write creates it silently.
+  prefs.begin("seq-timers", false);
   for (size_t i = 0; i < TIMER_COUNT; ++i) {
     const uint32_t defaultValue = (i == T_RUN_MODE) ? (sequenceTimersMs[i] / 3600000UL) : (sequenceTimersMs[i] / 1000UL);
     uint32_t value = prefs.getUInt(TIMER_KEYS[i], defaultValue);
@@ -1744,7 +1821,7 @@ void setup() {
   }
   prefs.end();
 
-  prefs.begin(PREF_NAMESPACE, true);
+  prefs.begin(PREF_NAMESPACE, false);
   staSSID = prefs.getString("ssid", "");
   staPassword = prefs.getString("password", "");
   apSSID = prefs.getString("apSsid", DEFAULT_AP_SSID);
@@ -1757,8 +1834,7 @@ void setup() {
   WiFi.onEvent(handleWiFiEvent);
   WiFi.setSleep(false);
   // Configure the AP address before starting the access point.
-  if (!WiFi.softAPConfig(AP_IP, AP_GATEWAY, AP_SUBNET)) failSafeHalt("Access point IP configuration failed");
-  if (!WiFi.softAP(apSSID.c_str(), apPassword.c_str())) failSafeHalt("Access point start failed");
+  if (!startAccessPoint()) failSafeHalt("Access point IP configuration / start failed");
   if (staSSID.length()) WiFi.begin(staSSID.c_str(), staPassword.c_str());
 
   server.on("/", HTTP_GET, handleRoot);
@@ -1778,7 +1854,7 @@ void setup() {
   server.collectHeaders(collectedHeaders, 2); // needed by requireSameOrigin()
   server.begin();
 
-  prefs.begin("analyzer", true);
+  prefs.begin("analyzer", false);
   uartBaud = prefs.getUInt("uartBaud", DEFAULT_UART_BAUD);
   canBitrate = prefs.getUInt("canRate", 500000);
   canListenOnly = prefs.getUInt("canListen", 0) == 1;

@@ -4,7 +4,7 @@ I.R.A. (Interactive Relay Automation) is an ESP32-S3 web-controlled relay sequen
 
 The Arduino sketch is [`ESP32-S3-N16R8V.ino`](ESP32-S3-N16R8V.ino). The included board image is [`ESP32-S3-N16R8V.jpg`](ESP32-S3-N16R8V.jpg).
 
-A native Kotlin Android controller app is in [`android-app/`](android-app/README.md). It connects to the ESP32's existing local HTTP API; it does not replace the firmware or browser dashboard.
+A native Kotlin Android controller app is in [`android-app/`](android-app/README.md). It connects to the ESP32's existing local HTTP API. The firmware does not run captive-portal DNS or redirect Wi-Fi sign-in checks; connect to the controller access point and open the app, or browse directly to `http://10.10.10.10/`.
 
 ## Board setup
 
@@ -45,17 +45,17 @@ The sketch drives the pictured 16-pin parallel character LCD as a 16x2 HD44780-c
 
 Check the LCD's logic-level requirements before connecting it. ESP32 GPIOs are 3.3 V and are not 5 V tolerant; a 5 V LCD module may require level shifting on the six ESP32-to-LCD signal lines. Do not connect a 5 V LCD signal output to an ESP32 pin.
 
-Connect a normally-open reset switch between **GPIO42** and **GND**. The sketch enables its internal pull-up and treats LOW as pressed; an external pull-up is not required. Do not connect this input to 5 V. The sketch also reports its raw level and debounced press count in **Diagnostics & controller health**. A detected press displays a dashboard toast and stops the sequence, turns all seven control outputs off, and silences the post-Run-Mode buzzer. This is a sequence reset; it does not reboot the ESP32.
+Connect a normally-open reset switch between **GPIO42** and **GND**. The sketch enables its internal pull-up and treats LOW as pressed; an external pull-up is not required. Do not connect this input to 5 V. The sketch also reports its raw level and debounced press count in **Diagnostics & controller health**. A detected press displays a dashboard toast, begins the controlled output ramp-down, and silences the post-Run-Mode buzzer. This is a sequence reset; it does not reboot the ESP32.
 
 ## Features
 
 - Wi-Fi access point and optional router connection. The dashboard is served at `http://10.10.10.10/` while connected to the device AP.
 - Manual controls for Brake, Enable, direction, and speed selections. Direction and speed are interlocked during automatic sequences.
 - Auto UP and Auto DOWN timed sequences, plus Run Mode that alternates direction until its configured duration expires.
-- Physical sequence reset button on GPIO42 stops an active sequence, returns the sequence controller to idle (READY when CAN is healthy), and silences the post-Run-Mode buzzer. When the dashboard is open, pressing it also displays a toast notification.
+- Stop and physical reset on GPIO42 ramp the outputs down in order (speed selections, direction, Enable, then Brake). Pressing Stop again at least 1 second into the ramp-down cuts the outputs immediately. Physical reset also silences the post-Run-Mode buzzer; when the browser dashboard is open, it displays a toast notification.
 - Configurable timers stored in ESP32 NVS, including the ready-signal delay and Run Mode duration.
-- Ready button behavior: a debounced press starts the configured delay; the ready relay activates only while the button remains held. A raw release turns the relay off immediately.
-- The buzzer beeps twice for 2 seconds each when an access-point client connects. After Run Mode completes, it gives 2-second pulses at the configured interval until stopped.
+- Ready button behavior: a press stable for 35 ms starts the configured delay; the ready relay activates only while the button remains held. A release stable for 25 ms turns the relay off.
+- The buzzer gives one 1-second beep when an access-point client connects; further joins within 10 seconds are ignored. After Run Mode completes, it gives 2-second pulses at the configured interval until stopped.
 - CAN/TWAI frame monitoring and manually initiated frame transmission through the protocol analyzer.
 - UART2 modes: Modbus RTU slave (unit ID 1), passive Modbus monitor, and raw UART text.
 - Live status, diagnostics, and a bounded analyzer event log.
@@ -63,11 +63,12 @@ Connect a normally-open reset switch between **GPIO42** and **GND**. The sketch 
 
 ### Control and diagnostic behavior
 
-- Run Mode completes its current automatic cycle before turning outputs off and starting the post-run buzzer. The dashboard Stop command and physical reset button stop the sequence immediately.
+- Run Mode completes its current automatic cycle before turning outputs off and starting the post-run buzzer, with a 2-second brake-off pause between directions. A Stop command or physical reset begins the controlled ramp-down; a second Stop command at least 1 second later cuts the outputs immediately.
 - All seven manual outputs are locked while an automatic sequence is active.
 - The control task is monitored by the task watchdog. The dashboard diagnostics report task health and task stack headroom.
-- The UART2 receive buffer is 1 KB. Modbus framing resynchronizes after an idle gap; UART overrun events are counted.
-- CAN/TWAI receive processing drains multiple queued frames per pass. Driver access is synchronized during transmit, recovery, and bitrate or listen-only reconfiguration. Listen-only mode does not ACK or transmit.
+- The UART2 receive buffer is 1 KB. Modbus RTU slave and passive-monitor frames are delimited by the required silent interval (3.5 character times, or 1.75 ms above 19200 baud); CRC and function-specific lengths are checked. The passive monitor can split merged supported frames by validating candidate lengths with CRC. UART overrun events are counted.
+- CAN/TWAI receive processing drains multiple queued frames per pass. Driver access is synchronized during transmit, recovery, and bitrate or listen-only reconfiguration. Reconfiguration reports success only when the requested settings are running; on failure it attempts to restore the previous settings. Listen-only mode does not ACK or transmit.
+- Access-point startup is retried up to three times. Fatal initialization errors hold outputs LOW, show the fault on the LCD, and restart the ESP32 after 10 seconds.
 - Timer values are persisted through the main loop, outside the UART/Modbus receive path.
 - State-changing dashboard POST requests are restricted by a same-origin check. The dashboard still has no login.
 
