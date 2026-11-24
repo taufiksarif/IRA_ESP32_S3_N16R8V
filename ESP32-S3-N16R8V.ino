@@ -49,7 +49,6 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
-#include <DNSServer.h>
 #include <Preferences.h>
 #include <Adafruit_NeoPixel.h>
 #include <LiquidCrystal.h>
@@ -110,8 +109,6 @@ uint32_t uartBaud = DEFAULT_UART_BAUD;
 uint32_t canBitrate = 500000;
 
 WebServer server(80);
-DNSServer dnsServer;
-static constexpr uint16_t DNS_PORT = 53;
 Preferences prefs;
 HardwareSerial ExternalSerial(2);
 SemaphoreHandle_t uartMutex;
@@ -768,23 +765,6 @@ const char INDEX_HTML[] PROGMEM =
   ".table-wrap{overflow-x:auto}table{width:100%;border-collapse:collapse}th,td{border:1px solid var(--line);padding:7px 9px;text-align:left;font-size:.85rem}th{color:var(--label)}\n"
   "@media(prefers-reduced-motion:reduce){button,.theme-toggle,body,.toast{transition:none}}\n"
   "</style></head><body><div id=\"toast\" class=\"toast\" role=\"status\" aria-live=\"polite\"></div><main>\n"
-  "<div id=\"fullBrowserPrompt\" style=\"display:none;position:sticky;top:0;z-index:9999;margin:0 0 12px;padding:12px;border:1px solid #2fa36b;border-radius:12px;background:#10251d;color:#eafff3;box-shadow:0 4px 16px #0005\">\n"
-  "  <div style=\"font-weight:700;margin-bottom:5px\">Open I.R.A. in your full browser</div>\n"
-  "  <div style=\"font-size:13px;margin-bottom:10px\">Android may keep this page inside the Wi-Fi sign-in window. Tap below to try opening Chrome.</div>\n"
-  "  <a id=\"openFullBrowser\" href=\"intent://10.10.10.10/#Intent;scheme=http;package=com.android.chrome;end\" style=\"display:inline-block;padding:10px 14px;border-radius:8px;background:#22a06b;color:#fff;font-weight:700;text-decoration:none\">Open in Chrome</a>\n"
-  "  <a href=\"http://10.10.10.10/\" style=\"display:inline-block;margin-left:8px;color:#d5f7e5\">Open dashboard here</a>\n"
-  "  "
-  "</div>\n"
-  "<script>\n"
-  "(function(){\n"
-  "  // Android captive-portal WebViews cannot be forced to launch Chrome. Offer an\n"
-  "  // explicit Android intent link, with a normal local URL fallback.\n"
-  "  var ua=navigator.userAgent||'';\n"
-  "  var isAndroid=/Android/i.test(ua);\n"
-  "  var isStandaloneChrome=/Chrome\\//i.test(ua)&&!/wv\\)|; wv\\)/i.test(ua);\n"
-  "  if(isAndroid&&!isStandaloneChrome){var p=document.getElementById('fullBrowserPrompt');if(p)p.style.display='block';}\n"
-  "})();\n"
-  "</script>\n"
   "<div class=\"topbar\"><div class=\"topbar-main\"><div class=\"brand\"><div class=\"brandmark\" aria-hidden=\"true\">⌁</div><div><h1>Repair Center</h1><div class=\"muted\">I.R.A - Interactive Relay Automation</div></div></div><div class=\"top-actions\"><button type=\"button\" class=\"theme-toggle\" id=\"openAnalyzer\">▤ Analyzer</button><div class=\"dash-pill status-hero warn\" id=\"safetyPill\"><span class=\"dash-icon\" aria-hidden=\"true\">!</span><span class=\"dash-copy\"><span class=\"dash-label\">Controller state</span><span class=\"dash-value\" id=\"dashSafety\">Checking…</span></span></div><button type=\"button\" class=\"theme-toggle\" id=\"themeToggle\" aria-label=\"Switch color theme\"><span class=\"theme-icon\" id=\"themeIcon\" aria-hidden=\"true\">☀️</span><span id=\"themeLabel\">Light mode</span></button></div></div><div class=\"dashboard\" aria-label=\"Live system dashboard\"><div class=\"dashboard-metrics\"><div class=\"dash-pill\" id=\"wifiPill\"><span class=\"dash-icon\" aria-hidden=\"true\">⌁</span><span class=\"dash-copy\"><span class=\"dash-label\">Wi-Fi STA</span><span class=\"dash-value\" id=\"dashWifi\">Checking…</span></span></div><div class=\"dash-pill\" id=\"ramPill\"><span class=\"dash-icon\" aria-hidden=\"true\">▦</span><span class=\"dash-copy\"><span class=\"dash-label\">Free RAM / minimum</span><span class=\"dash-value\" id=\"dashRam\">—</span></span></div><div class=\"dash-pill good\" id=\"ipPill\"><span class=\"dash-icon\" aria-hidden=\"true\">⌖</span><span class=\"dash-copy\"><span class=\"dash-label\">Access point IP</span><span class=\"dash-value\" id=\"dashIp\">10.10.10.10</span></span></div><div class=\"dash-pill\" id=\"clientPill\"><span class=\"dash-icon\" aria-hidden=\"true\">◎</span><span class=\"dash-copy\"><span class=\"dash-label\">Clients</span><span class=\"dash-value\" id=\"dashClients\">0 connected</span></span></div></div></div></div>\n"
   "<div class=\"connection-line\" id=\"connectionLine\"><span class=\"connection-dot\" aria-hidden=\"true\"></span><span id=\"connectionState\">Connecting…</span></div>\n"
   "<div class=\"card\"><h2>Controls</h2><p class=\"muted\">Tap a control to toggle its output. Run Mode alternates Auto UP and Auto DOWN for the configured duration.</p>\n"
@@ -1711,13 +1691,6 @@ bool reconfigureCan(uint32_t rate, bool listen) {
   return ok;
 }
 
-// Captive-portal detection: redirect HTTP probes to the I.R.A. dashboard.
-void redirectToPortal() {
-  server.sendHeader("Cache-Control", "no-store");
-  server.sendHeader("Location", String("http://") + AP_IP.toString() + "/", true);
-  server.send(302, "text/plain; charset=utf-8", "Opening I.R.A. dashboard...");
-}
-
 void failSafeHalt(const char *reason) {
   for (size_t i = 0; i < OUTPUT_COUNT; ++i) digitalWrite(OUTPUTS[i].pin, LOW);
   digitalWrite(PIN_READY_RELAY, LOW);
@@ -1786,20 +1759,9 @@ void setup() {
   // Configure the AP address before starting the access point.
   if (!WiFi.softAPConfig(AP_IP, AP_GATEWAY, AP_SUBNET)) failSafeHalt("Access point IP configuration failed");
   if (!WiFi.softAP(apSSID.c_str(), apPassword.c_str())) failSafeHalt("Access point start failed");
-  // Resolve all hostnames to the ESP32 so captive-portal checks reach this server.
-  if (!dnsServer.start(DNS_PORT, "*", AP_IP)) failSafeHalt("Captive portal DNS start failed");
   if (staSSID.length()) WiFi.begin(staSSID.c_str(), staPassword.c_str());
 
   server.on("/", HTTP_GET, handleRoot);
-  // Android, Apple and Windows captive-network probes. A redirect indicates
-  // that this Wi-Fi network requires a captive-portal sign-in/action.
-  server.on("/generate_204", HTTP_ANY, redirectToPortal);
-  server.on("/gen_204", HTTP_ANY, redirectToPortal);
-  server.on("/hotspot-detect.html", HTTP_ANY, redirectToPortal);
-  server.on("/library/test/success.html", HTTP_ANY, redirectToPortal);
-  server.on("/connecttest.txt", HTTP_ANY, redirectToPortal);
-  server.on("/ncsi.txt", HTTP_ANY, redirectToPortal);
-  server.on("/redirect", HTTP_ANY, redirectToPortal);
   server.on("/api/status", HTTP_GET, handleStatus);
   server.on("/api/analyzer", HTTP_GET, handleAnalyzer);
   server.on("/api/analyzer/config", HTTP_POST, handleAnalyzerConfig);
@@ -1812,9 +1774,7 @@ void setup() {
   server.on("/api/timers", HTTP_POST, handleTimersSave);
   server.on("/wifi", HTTP_POST, handleWifiSave);
   server.on("/apwifi", HTTP_POST, handleApWifiSave);
-  // Unknown HTTP paths are redirected to the dashboard, which also helps
-  // browsers opened by Android captive-portal notifications.
-  server.onNotFound(redirectToPortal);
+  server.onNotFound([]() { server.send(404, "text/plain; charset=utf-8", "Not found"); });
   static const char *collectedHeaders[] = {"Origin", "Host"};
   server.collectHeaders(collectedHeaders, 2); // needed by requireSameOrigin()
   server.begin();
@@ -1868,7 +1828,6 @@ void setup() {
 }
 
 void loop() {
-  dnsServer.processNextRequest();
   server.handleClient();
   flushDirtyTimers(); // NVS writes happen here, never in the UART/Modbus path
   const uint32_t now = millis();
