@@ -4,7 +4,7 @@ When connected, the Android app opens the dashboard served by the ESP32. When th
 
 ## Open in Android Studio
 
-Open the **`android-app` folder** in Android Studio. Let Gradle sync, and install Android SDK Platform 37 if prompted. The project includes a Gradle wrapper and uses Android Gradle Plugin 9.4.1, compile SDK 37, target SDK 36, and JDK 17 or newer.
+Open the **`android-app` folder** in Android Studio. Let Gradle sync, and install Android SDK Platform 37 if prompted. The project includes a Gradle wrapper and uses Android Gradle Plugin 9.5.2, compile SDK 37, target SDK 36, and JDK 17 or newer.
 
 ## Build and install
 
@@ -19,9 +19,11 @@ You can also build from a terminal in this folder with `./gradlew assembleDebug`
 1. Power on the ESP32 controller.
 2. Connect the phone to its Wi-Fi access point (default SSID: `Repair Center`; default password: `12345678`, unless changed in firmware settings).
 3. If Android asks whether to stay connected to a network without internet, choose to stay connected.
-4. Open IRA. It uses `http://10.10.10.10/` by default. Offline mode displays the packaged dashboard with simulated data; when the controller responds, the app switches to its live dashboard.
+4. Open IRA. It uses `http://10.10.10.10/` by default. Offline mode displays the packaged dashboard with simulated data. While the app is open it keeps checking every few seconds, and switches to the live dashboard as soon as the controller responds.
 
-The app requests the local Wi-Fi network and binds dashboard traffic to it. Analyzer TXT and CSV exports are saved to Downloads on Android 10 and later.
+If the controller is also connected to a router, the app remembers its router IP address and tries it too, so the dashboard also opens when the phone is on that router's Wi-Fi.
+
+The app requests the local Wi-Fi network and binds dashboard traffic to it. Analyzer TXT and CSV exports are saved to Downloads on Android 10 and later. On Android 8 and 9 they are saved to `Android/data/com.ira.controller/files/Download/`, and the confirmation message shows the full path.
 
 ## Google Play release bundle
 
